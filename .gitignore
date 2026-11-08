@@ -1,0 +1,11 @@
+# build output and local build script
+build/
+build.log
+build.bat
+vcpkg/
+*.zip
+
+
+# editors
+.vs/
+.vscode/
