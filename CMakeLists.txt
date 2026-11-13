@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(LazyFollowersNG VERSION 1.1.0 LANGUAGES CXX)  # -> LazyFollowersNG.dll
+project(LazyFollowersNG VERSION 1.3.0 LANGUAGES CXX)  # -> LazyFollowersNG.dll
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,7 +35,7 @@ add_commonlibsse_plugin(
     ${PROJECT_NAME}
     NAME "Lazy Followers NG"
     AUTHOR "Byronic"
-    VERSION 1.1.0
+    VERSION 1.3.0
     USE_ADDRESS_LIBRARY
     SOURCES
         src/main.cpp
@@ -45,11 +45,14 @@ add_commonlibsse_plugin(
         src/Tint.cpp
         src/Menu.cpp
         src/Hotkey.cpp
+        src/Voice.cpp
 )
 
 target_precompile_headers(${PROJECT_NAME} PRIVATE include/PCH.h)
 target_include_directories(${PROJECT_NAME} PRIVATE include src)
-target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json)
+# after add_commonlibsse_plugin: FindZLIB leaves regex match variables that break its version parsing
+find_package(ZLIB REQUIRED)  # compressed records in plugin files (Voice.cpp)
+target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json ZLIB::ZLIB)
 target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(${PROJECT_NAME} PRIVATE /permissive- /Zc:preprocessor /EHsc /utf-8 /W4 /wd4100)
 
@@ -61,8 +64,8 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:${PROJECT_NAME}>" "${PACKAGE_DIR}/SKSE/Plugins/"
     VERBATIM
 )
-# LazyFollowers.esp with every script (VMAD) stripped: same form IDs and file name,
-# so existing saves keep their follower slots. No .pex files - the DLL does what the scripts did.
+# LazyFollowers.esp with every script (VMAD) stripped, 100 slots, ESL-flagged with renumbered IDs
+# (Tools/eslify.py; old IDs -> new in src/EslIds.h). Same file name. No .pex files - the DLL does what the scripts did.
 # Only the esp from data/ (its README.txt stays out of the zip); LazyGirl's esp, modified with her permission (credit).
 file(GLOB LF_ESP "${CMAKE_SOURCE_DIR}/data/*.esp")
 if(LF_ESP)

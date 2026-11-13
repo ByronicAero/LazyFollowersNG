@@ -223,13 +223,18 @@ namespace Menu
 
         // Draws a row's name and moves the cursor to the section's control column (3 spaces right of the
         // longest name of the section). Returns false when the column did not fit (the control goes below).
-        bool RowName(const char* a_label, const char* a_tip, float a_minRight)
+        // a_measure false (NG, user: the gap moved when the long Override row came and went): this name does not
+        // widen the column; when longer than the column its control simply follows it.
+        bool RowName(const char* a_label, const char* a_tip, float a_minRight, bool a_measure = true)
         {
             const float startX = GetCursorPosX();
             const float rowAvail = GetContentRegionAvail().x;
             float&      column = g_nameColumn[g_page + '/' + g_section];
-            column = std::max(column, CalcTextSize(a_label, nullptr, true).x);
-            const float offset = column + CalcTextSize("   ").x;
+            const float labelW = CalcTextSize(a_label, nullptr, true).x;
+            if (a_measure) {
+                column = std::max(column, labelW);
+            }
+            const float offset = std::max(column, labelW) + CalcTextSize("   ").x;
             AlignTextToFramePadding();
             TextUnformatted(a_label);
             Tooltip(a_tip);
@@ -254,14 +259,14 @@ namespace Menu
 
         // Starts a setting row: the name, then the cursor at the section's control column. End it with EndRow /
         // EndRowNoReset. Returns false (draw nothing, no End) when the page search hides the row.
-        bool BeginRow(const char* a_label, const char* a_tip = nullptr)
+        bool BeginRow(const char* a_label, const char* a_tip = nullptr, bool a_measure = true)
         {
             if (!Show(a_label)) {
                 return false;
             }
             PushID(a_label);
             constexpr float spacing = 8.0f;
-            RowName(a_label, a_tip, kMinControlWidth + spacing + kResetWidth);
+            RowName(a_label, a_tip, kMinControlWidth + spacing + kResetWidth, a_measure);
             g_rowWidth = std::clamp(GetContentRegionAvail().x - spacing - kResetWidth, 60.0f, kMaxControlWidth);
             SetNextItemWidth(g_rowWidth);
             g_rowTip = a_tip;
@@ -438,13 +443,16 @@ namespace Menu
             return ConfirmButton("Reset All", a_tip, a_question, a_disabled);
         }
 
-        // The result line of the last action, blue or red.
-        void DrawNotice()
+        // The result line of the last action, blue or red. a_keepRoom (Followers page, user: the rows below jumped when
+        // the line came and went after Apply Settings): an empty line of the same height when there is none.
+        void DrawNotice(bool a_keepRoom = false)
         {
             bool        error = false;
             std::string text = LF::Notice(error);
             if (!text.empty()) {
                 TextColored(error ? kErrorRed : kValueBlue, "%s", text.c_str());
+            } else if (a_keepRoom) {
+                Dummy(ImVec2{ 0.0f, GetTextLineHeight() });
             }
         }
 
@@ -514,16 +522,29 @@ namespace Menu
             return true;
         }
 
-        // Keeps the Nearby Actors table's column widths as the user dragged them (call it after the
-        // TableSetupColumn calls, before TableHeadersRow), as Actor Control's KeepColumnWidths: a dragged width
-        // is saved in the settings file once the mouse is released and given back to the table every frame
-        // (ImGui alone forgot it whenever the page was drawn again).
-        void KeepColumnWidths()
+        // One table's kept column widths (KeepColumnWidths).
+        struct ColumnWidths
         {
-            static std::vector<float> s_last;  // the widths last frame
-            static std::vector<float> s_stored = LF::NearbyWidths();
-            static bool               s_dirty = false;
-            auto*                     table = GetCurrentTable();
+            std::vector<float> last;    // the widths last frame
+            std::vector<float> stored;  // as the user dragged them (from the settings file at first)
+            bool               dirty = false;
+            bool               loaded = false;
+        };
+
+        // Keeps a table's column widths as the user dragged them (call it after the TableSetupColumn calls, before
+        // TableHeadersRow), as Actor Control's KeepColumnWidths: a dragged width is saved in the settings file once
+        // the mouse is released (a_save) and given back to the table every frame (ImGui alone forgot it whenever the
+        // page was drawn again). NG (user): for the Nearby Actors and the Presets table.
+        void KeepColumnWidths(ColumnWidths& a_state, std::vector<float> (*a_load)(), void (*a_save)(const std::vector<float>&))
+        {
+            if (!a_state.loaded) {
+                a_state.stored = a_load();
+                a_state.loaded = true;
+            }
+            auto& s_last = a_state.last;
+            auto& s_stored = a_state.stored;
+            auto& s_dirty = a_state.dirty;
+            auto* table = GetCurrentTable();
             if (!table || !table->Columns.Data || table->ColumnsCount <= 0) {
                 return;
             }
@@ -555,7 +576,7 @@ namespace Menu
             s_last = now;
             if (s_dirty && !IsMouseDown(ImGuiMouseButton_Left)) {
                 s_dirty = false;
-                LF::SetNearbyWidths(s_stored);
+                a_save(s_stored);
             }
         }
 
@@ -636,7 +657,7 @@ namespace Menu
 
         // ---- page open tracking (the MCM's OnConfigOpen) ----
         using Clock = std::chrono::steady_clock;
-        std::array<Clock::time_point, 5> g_pageLastDraw{};
+        std::array<Clock::time_point, 6> g_pageLastDraw{};  // the 5 pages + the Nearby Actors window
 
         // Call at the top of each page. Returns true when the page was just opened.
         bool NoteDrawn(int a_page)
@@ -653,6 +674,9 @@ namespace Menu
         int               g_selected = 0;  // the follower slot all pages work on (the MCM's Nindex)
         Clock::time_point g_selectHold{};  // a just-requested selection (Add Follower) is kept until then
 
+        // Entries whose unapplied choices are dropped (CurrentEdit) - set when Apply moved the follower (take-over / give-back).
+        std::array<int, 2> g_forgetPending{ -1, -1 };
+
         // Pages need LazyFollowers.esp and a loaded game. Returns the snapshot (shared, not copied), or nullptr
         // after drawing why not.
         std::shared_ptr<const LF::Snapshot> Ready()
@@ -666,7 +690,14 @@ namespace Menu
                 TextDisabled("Load a game first.");
                 return nullptr;
             }
-            if (const int sel = LF::TakeSelect(); sel >= 0) {
+            bool moved = false;
+            if (const int sel = LF::TakeSelect(&moved); sel >= 0) {
+                // NG fix (user: the Override box flipped on / off after Apply Settings): a take-over / give-back moves the
+                // follower to another entry; unapplied choices left there from before (e.g. the box unticked for a
+                // give-back) showed instead of the new follower's values. Both entries start from what is applied.
+                if (moved) {
+                    g_forgetPending = { g_selected, sel };
+                }
                 g_selected = sel;
                 g_selectHold = Clock::now() + 1s;  // the snapshot may not list it yet
             }
@@ -694,16 +725,16 @@ namespace Menu
             return snapPtr;
         }
 
-        // A follower's name in the list: its applied name, else "Follower <slot number>".
+        // A follower's name in the list: its applied name, else "Follower <slot number>" (a real NPC: its name).
         std::string SlotLabel(const LF::Slot& a_s, int a_index)
         {
-            return a_s.Active() && !a_s.name.empty() ? a_s.name : std::format("Follower {}", a_index + 1);
+            return (a_s.Active() || a_s.real) && !a_s.name.empty() ? a_s.name : std::format("Follower {}", a_index + 1);
         }
 
-        // A follower in the Follower drop-down: its name and base NPC form ID (NG 1.1, user).
+        // A follower in the Follower drop-down: its name and base NPC form ID (NG 1.1, user); "(NPC)" = a real NPC.
         std::string PickerLabel(const LF::Slot& a_s, int a_index)
         {
-            return std::format("{}  [{:08X}]", SlotLabel(a_s, a_index), a_s.base);
+            return std::format("{}{}  [{:08X}]", SlotLabel(a_s, a_index), a_s.real ? " (NPC)" : "", a_s.base);
         }
 
         // The "Follower" drop-down at the top of the follower pages: only followers in use (NG 1.1, user).
@@ -711,7 +742,7 @@ namespace Menu
         bool FollowerPicker(const LF::Snapshot& a_snap, bool a_add)
         {
             const bool any = a_snap.slots[g_selected].Listed();
-            BeginRow("Follower", "The follower these pages work on (name + base NPC form ID).\nAdd Follower (Followers page) adds one; Reset / Dismiss takes it off the list.\n"
+            BeginRow("Follower", "The follower these pages work on (name + base NPC form ID).\nAdd Follower (Followers page) adds one; Remove takes it off the list.\n"
                                  "Opening the Followers page while looking at a follower selects it.");
             if (!any) {
                 TextDisabled(a_add ? "No followers yet - press Add Follower." : "No followers yet - add one on the Followers page.");
@@ -737,7 +768,7 @@ namespace Menu
             }
             EndRowNoReset();
             if (a_add) {
-                const bool full = std::all_of(a_snap.slots.begin(), a_snap.slots.end(), [](const LF::Slot& a_s) { return a_s.Listed(); });
+                const bool full = std::all_of(a_snap.slots.begin(), a_snap.slots.end(), [](const LF::Slot& a_s) { return a_s.real || a_s.Listed(); });
                 NextTo("Add Follower");
                 BeginDisabled(full);
                 if (Button("Add Follower")) {
@@ -771,6 +802,8 @@ namespace Menu
             std::string           presetFile;
             RE::FormID            race = 0;
             RE::FormID            voice = 0;
+            bool                  takeOver = false;  // NG 1.2: "Override the modded follower voiced .esp" (off = voice only; a taken-over NPC starts ticked)
+            std::string           erinPreset;        // NG (user): Erin race extra preset "<file>.ini" ("" = none)
         };
 
         // Unapplied choices stay until applied (NG 1.1 fix, user): per follower once something was changed, so
@@ -779,7 +812,26 @@ namespace Menu
         std::unordered_map<int, Edit> g_pending;
         unsigned                      g_pendingLoads = 0;
 
-        // The slot's applied values (a new follower: "Follower <n>" and the esp's race / voice) as an Edit.
+        // "Jenny.jslot" -> "Jenny" (the follower name a preset gives).
+        std::string PresetStem(const std::string& a_file)
+        {
+            constexpr std::string_view ext = ".jslot";
+            return a_file.size() > ext.size() && a_file.ends_with(ext) ? a_file.substr(0, a_file.size() - ext.size()) : a_file;
+        }
+
+        // NG (user): the Erin preset with a RaceMenu preset's name ("Ciel.jslot" -> "Ciel.ini"), "" = none there.
+        std::string ErinFor(const LF::Lists& a_lists, const std::string& a_presetFile)
+        {
+            const auto want = PresetStem(a_presetFile) + ".ini";
+            for (const auto& f : a_lists.erinPresets) {
+                if (_stricmp(f.c_str(), want.c_str()) == 0) {
+                    return f;
+                }
+            }
+            return {};
+        }
+
+        // The slot's applied values (a new follower: the first preset's name, race and the esp's voice) as an Edit.
         Edit FromSlot(const LF::Snapshot& a_snap, int a_slot)
         {
             const auto& s = a_snap.slots[a_slot];
@@ -795,7 +847,21 @@ namespace Menu
                 e.presetFile = presets.empty() ? std::string{} : presets.front();
             }
             e.race = s.race;
+            // NG (user): a follower without a preset yet starts with the race of the preset shown
+            if (s.preset.empty()) {
+                if (auto it = a_snap.lists->presetRaces.find(e.presetFile); it != a_snap.lists->presetRaces.end()) {
+                    e.race = it->second;
+                }
+                // NG (user): ... and the name of that preset (Jenny.jslot -> "Jenny")
+                if (!e.presetFile.empty()) {
+                    strncpy_s(e.name.data(), e.name.size(), PresetStem(e.presetFile).c_str(), _TRUNCATE);
+                }
+                e.erinPreset = ErinFor(*a_snap.lists, e.presetFile);  // NG (user): ... and its Erin preset (same name)
+            } else {
+                e.erinPreset = s.erinPreset;
+            }
             e.voice = s.voice;
+            e.takeOver = s.real;  // NG 1.2: a real NPC (e.g. taken-over Sofia) is the override - unticking undoes it
             return e;
         }
 
@@ -806,6 +872,12 @@ namespace Menu
             if (const auto loads = LF::GameLoads(); loads != g_pendingLoads) {
                 g_pending.clear();
                 g_pendingLoads = loads;
+            }
+            for (auto& f : g_forgetPending) {
+                if (f >= 0) {
+                    g_pending.erase(f);
+                    f = -1;
+                }
             }
             if (auto it = g_pending.find(g_selected); it != g_pending.end()) {
                 return it->second;
@@ -847,7 +919,11 @@ namespace Menu
             const auto&       live = snap.live[g_selected];
             const std::string who = SlotLabel(s, g_selected);
             // NG 1.1 (user): Distance + Location instead of Status
-            if (!live.enabled) {
+            if (!live.enabled && s.real) {
+                LabelValue("Distance:", "%s", "Disabled");
+                Tooltip("The NPC is disabled (by its own mod or the game) or not in the game right now.");
+                LabelValue("Location:", "%s", "Unknown");  // NG fix: same rows as when enabled (it is disabled for a moment while its look changes)
+            } else if (!live.enabled) {
                 LabelValue("Distance:", "%s", "In storage");
                 Tooltip("Dismissed or never summoned (disabled in Lazy Followers' storage cell).");
                 LabelValue("Location:", "%s", "Lazy Followers storage");
@@ -860,12 +936,44 @@ namespace Menu
                 }
                 LabelValue("Location:", "%s", snap.selLocation.empty() ? "Unknown" : snap.selLocation.c_str());
             }
-            DrawNotice();
+            // NG (user): Keep in New Game per follower (was one Settings option, removed in (64))
+            if (BeginRow("Keep in New Game", s.real ? "Ticked: every save writes this NPC (name, preset, race, worn gear) to\n"
+                                                      "Data/SKSE/Plugins/LazyFollowers/LazyFollowersNGKeep.json, and a NEW game takes it over again\n"
+                                                      "(like Apply Settings with Override the modded follower voiced .esp) half a second after you close\n"
+                                                      "RaceMenu (character creation). Pre Summon (shown when ticked) decides whether it comes to you."
+                                                    : "Ticked: every save writes this follower (name, preset, race, voice, sex, style, class, spells, worn gear)\n"
+                                                      "to Data/SKSE/Plugins/LazyFollowers/LazyFollowersNGKeep.json, and a NEW game brings it back\n"
+                                                      "half a second after you close RaceMenu (character creation). Pre Summon (shown when ticked) decides whether it comes to you.")) {
+                bool v = s.keep;
+                bool changed = Checkbox("##v", &v);
+                if (EndRow(!v)) {
+                    v = false;
+                    changed = true;
+                }
+                if (changed) {
+                    LF::SetKeep(g_selected, v);
+                }
+            }
+            // NG (user): only with Keep in New Game ticked
+            if (s.keep && BeginRow("Pre Summon", "Ticked: in the new game this follower is summoned to you once it is back.\n"
+                                                  "Unticked: it comes back but stays where it is (Summon NPC / Summon All bring it).")) {
+                bool v = s.preSummon;
+                bool changed = Checkbox("##v", &v);
+                if (EndRow(!v)) {
+                    v = false;
+                    changed = true;
+                }
+                if (changed) {
+                    LF::SetPreSummon(g_selected, v);
+                }
+            }
+            DrawNotice(true);
 
             Section("Appearance", "Pick name, preset, race and voice, then Apply Settings (the MCM's \"Apply settings\").\n"
                                   "Your choices stay while you look at other followers or pages until you apply them.");
             auto& e = CurrentEdit(snap);
-            BeginRow("Name", "The follower's name (applied with Apply Settings).");
+            BeginRow("Name", s.real ? "The NPC's name in game (nameplate, talk menu, subtitles) - applied with Apply Settings.\nIts recorded voice still says its own name; Remove gives it back."
+                                    : "The follower's name (applied with Apply Settings).");
             if (InputText("##v", e.name.data(), e.name.size())) {
                 Touched(e);
             }
@@ -886,16 +994,63 @@ namespace Menu
                         [&](int i) -> std::string_view { return lists.presets[i]; });
                     p >= 0) {
                     e.presetFile = lists.presets[p];
+                    // NG (user): picking a preset also puts its name in Name (Jenny.jslot -> "Jenny"; can still be typed over)
+                    strncpy_s(e.name.data(), e.name.size(), PresetStem(e.presetFile).c_str(), _TRUNCATE);
+                    // NG (user): picking a preset also picks the race it was made for (Race can still be changed)
+                    if (auto it = lists.presetRaces.find(e.presetFile); it != lists.presetRaces.end()) {
+                        e.race = it->second;
+                    }
+                    // NG (user): ... and the Erin preset with its name, when there is one (else Erin Preset stays as it is)
+                    if (auto erin = ErinFor(lists, e.presetFile); !erin.empty()) {
+                        e.erinPreset = erin;
+                    }
                     Touched(e);
                 }
             }
             EndRowNoReset();
-            BeginRow("Race", "Every playable race of your load order (rebuilt each time this page opens),\nplus races of NPCs you looked at when opening the page.");
-            if (auto id = ChoiceSearchCombo("##v", lists.races, e.race)) {
-                e.race = id;
-                Touched(e);
+            BeginRow("Race", "Every playable race of your load order (rebuilt each time this page opens),\nplus races of NPCs you looked at when opening the page.\n"
+                             "The preset's own race (found from its head parts) is listed first and picked when you pick a preset.");
+            {
+                // NG (user): the preset's race first in the list, marked
+                std::vector<LF::Choice> races = lists.races;
+                if (auto it = lists.presetRaces.find(e.presetFile); it != lists.presetRaces.end()) {
+                    if (auto r = std::find_if(races.begin(), races.end(), [&](const LF::Choice& c) { return c.id == it->second; }); r != races.end()) {
+                        LF::Choice first = *r;
+                        first.name += "  (preset's race)";
+                        races.erase(r);
+                        races.insert(races.begin(), std::move(first));
+                    }
+                }
+                if (auto id = ChoiceSearchCombo("##v", races, e.race)) {
+                    e.race = id;
+                    Touched(e);
+                }
             }
             EndRowNoReset();
+            const bool erinRace = lists.erinRaces.contains(e.race);  // NG (user): Erin Preset only for an Erin race
+            // NG (user): the Erin race's own preset (extra tints, eye colour set, skin, head-part adjust) - RaceMenu's .jslot
+            // does not have it. Only while an Erin race is picked in Race (MuErinRace.dll installed).
+            if (!lists.erinPresets.empty() && erinRace) {
+                BeginRow("Erin Preset", "The Erin race's own preset (Data/SKSE/Plugins/ErinRace/Preset, .ini): extra tints, eye colour set,\n"
+                                        "skin and head-part adjustments - things RaceMenu's .jslot does not keep.\n"
+                                        "Loaded onto the follower after the RaceMenu preset (Apply Settings, and each time its look is applied).\n"
+                                        "Picking a preset picks the Erin preset with the same name, when there is one.\n"
+                                        "Shown only while an Erin race is picked. Remove takes it off again.");
+                int cur = 0;  // 0 = (none)
+                for (int i = 0; i < static_cast<int>(lists.erinPresets.size()); ++i) {
+                    if (_stricmp(lists.erinPresets[i].c_str(), e.erinPreset.c_str()) == 0) {
+                        cur = i + 1;
+                    }
+                }
+                const auto shown = cur ? lists.erinPresets[cur - 1] : std::string("(none)");
+                if (const int p = SearchCombo("##erin", shown.c_str(), static_cast<int>(lists.erinPresets.size()) + 1, cur,
+                        [&](int i) -> std::string_view { return i ? std::string_view(lists.erinPresets[i - 1]) : std::string_view("(none)"); });
+                    p >= 0) {
+                    e.erinPreset = p ? lists.erinPresets[p - 1] : std::string{};
+                    Touched(e);
+                }
+                EndRowNoReset();
+            }
             // two lists like the MCM's; the follower gets the voice picked last (the other shows "(none)")
             BeginRow("Female Voice", "Starred voices are vanilla follower-friendly.\nVoices of NPCs you looked at when opening the page are added.\nThe follower gets the voice you picked last (female, male or other list).");
             if (auto id = ChoiceSearchCombo("##v", lists.femaleVoices, e.voice)) {
@@ -911,19 +1066,93 @@ namespace Menu
             EndRowNoReset();
             BeginRow("Other Voice", "Every other voice type of your load order (modded voices, creature / unique voices...).\n"
                                     "Names need po3's Tweaks (editor IDs); without it they show the form ID. Not every voice has follower dialogue.\n"
-                                    "The follower gets the voice you picked last (female, male or other list).");
+                                    "The follower gets the voice you picked last (female, male or other list).\n"
+                                    "A modded voice (e.g. Sofia's): the follower uses its mod's lines; see Override the modded follower voiced .esp\n"
+                                    "(shown when such a voice is picked).");
             if (auto id = ChoiceSearchCombo("##v", lists.otherVoices, e.voice)) {
                 e.voice = id;
                 Touched(e);
             }
             EndRowNoReset();
-            if (ConfirmButton("Apply Settings", "Applies name, preset, race and voice to the follower (full preset apply)\nand summons it to you (like Summon NPC).",
+            // NG 1.2 (user, option 3): taking over a modded voice's own NPC is a choice per follower, off by default.
+            // NG 1.2 (user): renamed from "Take Over NPC"; also shown on the taken-over NPC (ticked) so it can be undone.
+            // NG (user): renamed "... voiced .esp"; on a slot it only shows when the picked voice belongs to a modded
+            // follower NPC of the game (Lists::ownedVoices, e.g. Sofia's), so it doesn't confuse with other voices
+            const bool showOverride = s.real ? s.moddedVoice : lists.ownedVoices.contains(e.voice);
+            // NG (user): the voice's NPC is already another follower's Override -> Apply Settings with the box ticked asks
+            // to move it here (Yes: that follower gives the NPC back - it goes to a free slot with the voice - and this
+            // follower takes it over with this page's settings). Ticking the box alone does nothing yet (user). Also on a
+            // taken-over NPC's page when another follower's voice is picked (it is given back, see LF::Apply).
+            int holder = -1;
+            if (showOverride && e.voice) {
+                for (int k = 0; k < static_cast<int>(snap.slots.size()); ++k) {
+                    const auto& o = snap.slots[k];
+                    if (k != g_selected && o.real && o.Active() && o.voice == e.voice) {
+                        holder = k;
+                        break;
+                    }
+                }
+            }
+            bool openMove = false;
+            if (showOverride) {
+                BeginRow("Override the modded follower voiced .esp",
+                    s.real ? "Ticked: this NPC (the voice's own NPC) is your follower with this preset, race and name.\n"
+                             "Untick, then Apply Settings: it is given back (own look, name and outfit, sent to its own place)\n"
+                             "and a free Lazy Followers slot becomes the follower with this preset, race and name and the\n"
+                             "NPC's voice (voice only - its mod's lines are swapped in). The follower's gear goes along.\n"
+                             "Another modded follower's voice picked (box ticked) + Apply Settings: this NPC is given back and\n"
+                             "that voice's own NPC becomes the follower with this preset, race and name (gear and Keep boxes go along)."
+                           : "Off: the follower only borrows the voice - its mod's lines are swapped in; the voice's own NPC\n"
+                             "(e.g. Sofia) stays as it is. Several followers can share one voice.\n"
+                             "On: Apply Settings makes the voice's own NPC the follower with this preset, race and name -\n"
+                             "its own voice, dialogue, quests and scripts (its look changes while it is your follower);\n"
+                             "this slot goes back to storage. One follower per voice; untick it there (or Remove) to give the NPC back.\n"
+                             "Shown only for a modded follower's voice whose own NPC is in your game.",
+                    false);  // its long name does not widen the section's column (no gap jump when it shows / hides)
+                bool v = e.takeOver;
+                if (Checkbox("##v", &v)) {  // NG (user): ticking only ticks - Apply Settings does (and asks) the rest
+                    e.takeOver = v;
+                    Touched(e);
+                }
+                if (EndRow(e.takeOver == s.real)) {
+                    e.takeOver = s.real;
+                    Touched(e);
+                }
+            }
+            if (ConfirmButton("Apply Settings", s.real ? "Applies name, preset, race and voice to the NPC (full preset apply)\nand summons it to you (like Summon NPC)."
+                                                       : "Applies name, preset, race and voice to the follower (full preset apply)\nand summons it to you (like Summon NPC).\n"
+                                                         "With Override the modded follower voiced .esp on and a modded voice whose own NPC is in your game (e.g. Sofia): that NPC\n"
+                                                         "becomes the follower with this preset, race and name (its own voice and dialogue); this slot goes back to storage.",
                     std::format("Apply settings to {}?", who), e.presetFile.empty())) {
                 Touched(e);  // what was applied stays shown
-                LF::Apply(g_selected, { e.name.data(), e.race, e.voice, e.presetFile });
+                if (e.takeOver && holder >= 0) {
+                    openMove = true;
+                } else {
+                    LF::ApplyRequest req{ e.name.data(), e.race, e.voice, e.presetFile, s.real ? e.takeOver : e.takeOver && showOverride };  // a slot's hidden box counts as off
+                    req.erinPreset = erinRace ? e.erinPreset : std::string{};  // another race: no Erin preset (the old one is taken off)
+                    LF::Apply(g_selected, std::move(req));
+                }
+            }
+            if (openMove) {
+                OpenPopup("Override already in use##moveOverride");
+            }
+            if (holder >= 0) {
+                const auto& h = snap.slots[holder];
+                if (ConfirmDialog("Override already in use##moveOverride",
+                        std::format("{} is already the Override of your follower {}.\n"
+                                    "Remove it from {} and put it on {}?\n\n"
+                                    "{} gives {} back and goes to a free slot with that voice (voice only);\n"
+                                    "{} takes {} over now with this page's name, preset and race.",
+                            h.defaultName, h.name, h.name, who, h.name, h.defaultName, who, h.defaultName))) {
+                    e.takeOver = true;
+                    Touched(e);
+                    LF::ApplyRequest req{ e.name.data(), e.race, e.voice, e.presetFile, true };  // no preset: Apply says so
+                    req.erinPreset = erinRace ? e.erinPreset : std::string{};
+                    LF::MoveOverride(holder, g_selected, std::move(req));
+                }
             }
 
-            if (!lists.npcPresets.empty()) {
+            if (!lists.npcPresets.empty() && !s.real) {
                 Section("NPC Preset", "Followers saved with \"Save Each NPC Separately\" (Data/SKSE/Plugins/LazyFollowers/LazyFollowersNPCs).");
                 if (g_npcPresetFor != g_selected || std::find(lists.npcPresets.begin(), lists.npcPresets.end(), g_npcPreset) == lists.npcPresets.end()) {
                     const auto mine = who + ".json";
@@ -957,19 +1186,22 @@ namespace Menu
                     LF::TeleportTo(g_selected);
                 }
             }
-            NextTo("Reset / Dismiss");
-            if (ConfirmButton("Reset / Dismiss", "Resets all changes to the follower, sends it back to storage and takes it off the Follower list.",
-                    std::format("Reset + dismiss {}?", who))) {
+            NextTo("Remove");
+            if (s.real ? ConfirmButton("Remove", "Gives the NPC its own look and name back and takes it off the Follower list;\nit goes back to its own place in the world (its own mod may still call it a follower).",
+                             std::format("Remove {}? (own look and name back, sent to its own place)", who))
+                       : ConfirmButton("Remove", "Resets all changes to the follower, sends it back to storage and takes it off the Follower list.",
+                             std::format("Remove {}? (all changes reset, back to storage)", who))) {
                 g_pending.erase(g_selected);
                 LF::Dismiss(g_selected);
             }
             if (live.loaded) {
                 NextTo("Copy Kit");
-                if (ConfirmButton("Copy Kit", "Copies your worn equipment to the follower.", std::format("Copy your equipment to {}?", who))) {
+                if (ConfirmButton("Copy Kit", "Copies your whole inventory to the follower (not gold or quest items; what it already has is not doubled).\n"
+                                                  "Include Equipment: also what you wear. Auto Equip: puts that on the follower.", std::format("Copy your inventory to {}?", who))) {
                     LF::CopyKit(g_selected);
                 }
             }
-            BeginRow("Auto Equip", "Copy Kit also equips the copied items. WARNING - can crash the game (as in the original mod).");
+            BeginRow("Auto Equip", "Copy Kit also puts on the armor and weapons you wear. WARNING - can crash the game (as in the original mod).");
             {
                 bool v = LF::AutoEquip();
                 if (Checkbox("##v", &v)) {
@@ -977,6 +1209,17 @@ namespace Menu
                 }
                 if (EndRow(!v)) {
                     LF::SetAutoEquip(false);
+                }
+            }
+            BeginRow("Include Equipment", "Copy Kit also copies the armor and weapons you are wearing (on by default).\n"
+                                          "Off: only the rest of your inventory is copied, and Auto Equip has nothing to put on.");
+            {
+                bool v = LF::IncludeEquipment();
+                if (Checkbox("##v", &v)) {
+                    LF::SetIncludeEquipment(v);
+                }
+                if (EndRow(v)) {
+                    LF::SetIncludeEquipment(true);
                 }
             }
 
@@ -997,7 +1240,9 @@ namespace Menu
                 }
             }
 
-            Section("Behaviour", "Combat style and class are applied right away.");
+            // NG (user): also for a taken-over NPC (its own style / class come back on Remove)
+            Section("Behaviour", s.real ? "Combat style and class are applied right away.\nRemove (or giving it back) puts the NPC's own ones back."
+                                        : "Combat style and class are applied right away.");
             BeginRow("Combat Style", "One of the 10 Lazy Followers combat styles (edit them on the Combat Styles page).");
             if (!LF::StylesEnabled()) {
                 TextDisabled("Disabled (Settings)");
@@ -1396,21 +1641,55 @@ namespace Menu
         // Settings page (MCM page " Debug" + " SaveLoad" + Save Actor Preset)
         // ------------------------------------------------------------------
         RE::FormID           g_pickRef = 0;  // the ticked actor in Nearby Actors (one at a time)
+        RE::FormID           g_seenConsole = 0;    // console selection / last crosshair actor already ticked once
+        RE::FormID           g_seenCrosshair = 0;
+
+        // NG (user: the Add buttons did nothing; then "console target before crosshair"): a NEW console selection is
+        // put in the list and ticked; a NEW actor looked at only while nothing is selected in the console. Each once,
+        // so a row ticked by hand afterwards sticks. Called when the list draws and by the Open Inventory hotkey.
+        // a_crosshair counts only when a_useCrosshair (NG fix, user video 10-05-14: in the Nearby Actors window the game
+        // runs, the crosshair kept passing over followers and the tick jumped back to them): when the page / window
+        // opens, and for the hotkey while the Nearby Actors window is closed.
+        void UpdatePick(RE::FormID a_console, RE::FormID a_crosshair, bool a_consoleBusy, bool a_useCrosshair)
+        {
+            if (a_console == 0x14) {
+                a_console = 0;  // you: not a target
+            }
+            if (a_crosshair == 0x14) {
+                a_crosshair = 0;
+            }
+            if (a_console && a_console != g_seenConsole) {
+                LF::AddNearby(a_console);
+                g_pickRef = a_console;
+            } else if (a_useCrosshair && !a_console && !a_consoleBusy && a_crosshair && a_crosshair != g_seenCrosshair) {
+                LF::AddNearby(a_crosshair);
+                g_pickRef = a_crosshair;
+            }
+            g_seenConsole = a_console;
+            if (a_useCrosshair) {
+                g_seenCrosshair = a_crosshair;  // not seen while ignored: still new when the list opens again
+            }
+        }
         std::array<char, 64> g_nearbySearch{};
         std::array<char, 80> g_presetName{};
 
         // "Nearby Actors" like Actor Control's (one actor at a time, Actor + Distance columns): radius bar +
-        // "Scan radius" + Scan nearby NPCs + Reset, then the search box, "n of m selected", Add console
-        // selection / Add crosshair target, the table (grip under it) - and, merged in (user), Save Actor
-        // Preset for the ticked actor.
-        void DrawNearbyActors(const LF::Snapshot& a_snap)
+        // "Scan radius" + Scan nearby NPCs + Reset, then the search box, "n of m selected", the table (grip
+        // under it) - and, merged in (user), Save Actor Preset for the ticked actor. The console selection and
+        // the last actor looked at are added and ticked by themselves (user).
+        // a_opened: the page / window was just opened (the actor looked at may be ticked then).
+        void DrawNearbyActors(const LF::Snapshot& a_snap, bool a_opened)
         {
             Section("Nearby Actors", "Scan the area and tick the actor Save Actor Preset saves (one at a time).\n"
-                                     "You are always first in the list. Opening this page scans once.\n\n"
+                                     "An NPC you click with the console open is added and ticked by itself; so is the last NPC you looked at\n"
+                                     "while nothing is selected in the console (the console selection comes first).\n"
+                                     "The Open Inventory hotkey (Settings > Hotkey) opens the ticked NPC's inventory.\n"
+                                     "You are always first in the list. Opening this page scans once, and so does\n"
+                                     "loading a save or entering a new cell (2 seconds later, when the NPCs there have loaded).\n\n"
                                      "Save Actor Preset writes the actor's RaceMenu look as Data/SKSE/Plugins/CharGen/Exported/<name>.jslot\n"
                                      "(the file \"skee preset-save <name>\" makes - it shows up in the Followers page's Preset list)\n"
                                      "and its face tint as Data/Textures/CharGen/Exported/<name>.dds. No console needed.");
-            if (!ShowGroup("Nearby Actors Scan radius Scan nearby NPCs Add console selection Add crosshair target Save Actor Preset Preset Name")) {
+            if (!ShowGroup("Nearby Actors Scan radius Scan nearby NPCs Save Actor Preset Preset Name")) {
                 return;
             }
             // the radius bar first, its name right of it, then Scan and Reset (as in Actor Control)
@@ -1434,7 +1713,8 @@ namespace Menu
                     LF::ScanNearby();
                 }
                 EndDisabled();
-                Tooltip("Only scans when you press this (or open the page), so it costs nothing while playing.\nOnly NPCs loaded near you are checked.");
+                Tooltip("Scans now. It also scans by itself when you open this page, load a save or enter a new cell -\n"
+                        "one quick pass each time, nothing runs in between. Only NPCs loaded near you are checked.");
                 const bool isDefault = LF::ScanRadius() == LF::kDefaultScanRadius;
                 NextToWidth(kResetWidth);
                 BeginDisabled(isDefault);
@@ -1448,6 +1728,14 @@ namespace Menu
                 PopID();
             }
 
+            if (a_opened) {
+                // just opened: the snapshot may be from before (it is only rebuilt while a page is up) - read them now
+                const auto now = LF::PickRefs();
+                UpdatePick(now.console, now.crosshair, now.consoleBusy, true);
+            } else {
+                UpdatePick(a_snap.consoleRef, a_snap.crosshairRef, a_snap.consoleBusy, false);
+            }
+            const RE::FormID pickBefore = g_pickRef;
             const auto all = LF::Nearby();
             const bool ticked = std::any_of(all.begin(), all.end(), [](const LF::NearbyActor& a_n) { return a_n.id == g_pickRef; });
             SetNextItemWidth(340.0f);
@@ -1462,18 +1750,6 @@ namespace Menu
             NextToWidth(CalcTextSize(selected.c_str()).x);
             AlignTextToFramePadding();
             TextUnformatted(selected.c_str());
-            NextTo("Add console selection");
-            if (Button("Add console selection") && a_snap.consoleRef) {
-                LF::AddNearby(a_snap.consoleRef);
-                g_pickRef = a_snap.consoleRef;
-            }
-            Tooltip("The NPC picked in the console (click it with the console open).");
-            NextTo("Add crosshair target");
-            if (Button("Add crosshair target") && a_snap.crosshairRef) {
-                LF::AddNearby(a_snap.crosshairRef);
-                g_pickRef = a_snap.crosshairRef;
-            }
-            Tooltip("The last actor you looked at.");
 
             if (all.empty()) {
                 TextDisabled("No NPCs found yet.");
@@ -1490,7 +1766,8 @@ namespace Menu
                 if (BeginListTable("##nearby2", 2, count, GetFrameHeight(), 300.0f + 90.0f, static_cast<std::size_t>(rows))) {
                     TableSetupColumn("Actor", ImGuiTableColumnFlags_WidthFixed, 300.0f);
                     TableSetupColumn("Distance", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-                    KeepColumnWidths();
+                    static ColumnWidths s_cols;
+                    KeepColumnWidths(s_cols, LF::NearbyWidths, LF::SetNearbyWidths);
                     TableHeadersRow();
                     for (auto* n : shown) {
                         PushID(static_cast<int>(n->id));
@@ -1522,6 +1799,13 @@ namespace Menu
                     }
                     EndTable();
                     ListTableGrip("##nearbygrip", rows, count, GetFrameHeight(), LF::SetNearbyRows);
+                }
+            }
+
+            // NG (user video 08-19-05): another actor ticked while the inventory Open Inventory opened is up -> it switches
+            if (g_pickRef != pickBefore && g_pickRef) {
+                if (const auto open = LF::InventoryOpenFor(); open && open != g_pickRef) {
+                    LF::OpenInventory(g_pickRef);
                 }
             }
 
@@ -1562,9 +1846,12 @@ namespace Menu
             }
             int v = LF::GetGlobal(a_g);
             if (SliderInt("##v", &v, a_min, a_max, a_format, ImGuiSliderFlags_AlwaysClamp)) {
-                LF::SetGlobal(a_g, v);
+                LF::SetGlobal(a_g, v, false);  // NG cleanup: the file is written once, on release
             }
             done = IsItemDeactivatedAfterEdit();
+            if (done) {
+                LF::SaveSettingsFile();
+            }
             if (EndRow(v == LF::GlobalDefault(a_g))) {
                 LF::SetGlobal(a_g, LF::GlobalDefault(a_g));
                 done = true;
@@ -1594,9 +1881,303 @@ namespace Menu
             "0 Default (full)\n1 Overrides\n2 Body\n3 Overrides + Body\n4 Transforms\n5 Overrides + Transforms\n6 Body + Transforms\n"
             "7 Overrides + Body + Transforms\n8 Skin\n11 Skin + Body + Overrides\n13 Overrides + Transforms + Skin\n15 All";
 
+        std::map<Hotkey::Key, LF::KeyBinding> g_keyAtStart;  // each hotkey as the settings file had it when the game started
+
+        // A Hotkey section row: the key button (click, then press a key) + Clear (no key, greyed when none) + Reset
+        // (NG, user: "clear and reset button") = back to the key it had when the game started (greyed when unchanged).
+        void HotkeyRow(const char* a_label, const char* a_tip, Hotkey::Key a_which, LF::KeyBinding a_key, void (*a_set)(LF::KeyBinding))
+        {
+            const auto start = g_keyAtStart.try_emplace(a_which, a_key).first->second;  // first draw = the loaded key
+            if (!BeginRow(a_label, a_tip)) {
+                return;
+            }
+            const bool capturing = Hotkey::Capturing(a_which);
+            const auto label = capturing ? std::string("Press a key...") : Hotkey::Name(a_key);
+            if (Button((label + "###key").c_str(), ImVec2{ g_rowWidth, 0.0f })) {
+                if (capturing) {
+                    Hotkey::CancelCapture();
+                } else {
+                    Hotkey::BeginCapture(a_which);
+                }
+            }
+            Tooltip(g_rowTip);  // the row's help on the key button (EndRow would put it on Clear)
+            g_rowTip = nullptr;
+            NextToWidth(kResetWidth);
+            BeginDisabled(!a_key.IsSet() && !capturing);
+            if (Button("Clear", ImVec2{ kResetWidth, 0.0f })) {
+                if (capturing) {
+                    Hotkey::CancelCapture();
+                }
+                a_set({});
+            }
+            EndDisabled();
+            if (a_key.IsSet() && IsItemHovered()) {
+                SolidTooltip("No key");
+            }
+            const bool unchanged = a_key.vk == start.vk && a_key.mods == start.mods;
+            const auto resetTip = std::format("Back to {} (the key when the game started)", Hotkey::Name(start));
+            if (EndRow(unchanged, resetTip.c_str())) {
+                if (capturing) {
+                    Hotkey::CancelCapture();
+                }
+                a_set(start);
+            }
+        }
+
+        std::set<std::string> g_presetSel;  // Settings > Presets: the ticked files ("<name>.jslot" / "<name>.jslot.hidden")
+        std::array<char, 64>  g_presetSearch{};
+        std::string           g_presetNotice;  // NG (user): the last Hide / Unhide / Delete result, next to "x of y selected"
+        bool                  g_presetNoticeError = false;
+        int                   g_presetAsk = 0;  // NG: right-click Hide (1) / Delete (2) picked - its Yes / No dialog opens next
+
+        // The Presets section's result line (also in the log).
+        void PresetNotice(std::string a_text, bool a_error = false)
+        {
+            if (a_error) {
+                logger::warn("{}", a_text);
+            } else {
+                logger::info("{}", a_text);
+            }
+            g_presetNotice = std::move(a_text);
+            g_presetNoticeError = a_error;
+        }
+
+        // The result text (user: "x of <selected> presets are hidden", nothing more - details go to the log).
+        std::string PresetResult(int a_done, std::size_t a_of, const char* a_what)
+        {
+            return a_of == 1 ? std::format("{} of 1 preset is {}", a_done, a_what) : std::format("{} of {} presets are {}", a_done, a_of, a_what);
+        }
+
+        // NG (user: "Hide, Unhide, Delete files - and multiple"): Settings > Presets - every RaceMenu preset of
+        // CharGen/Exported in one table (shown + hidden, a search box, tick any number; hidden rows greyed out). Right-click
+        // menu (user: instead of buttons): select all shown / none, Hide / Unhide / Delete on the ticked ones. Hide renames
+        // the .jslot, .dds tint and .nif head mesh to <file>.hidden (nothing deleted); Unhide renames them back; Delete
+        // removes them for good. Hide and Delete ask first and say which followers use the presets. The result
+        // ("x of y presets are hidden") stands next to the "x of y selected" count; details only in the log.
+        void DrawHidePreset(const LF::Snapshot& a_snap)
+        {
+            Section("Presets", "RaceMenu presets in Data/SKSE/Plugins/CharGen/Exported (the Followers page's Preset list).\n"
+                               "Tick presets in the table, then right-click it (also: select all shown / none):\n"
+                               "Hide - renames <name>.jslot, its tint Textures/CharGen/Exported/<name>.dds and head mesh <name>.nif\n"
+                               "to <file>.hidden: gone from the lists, nothing deleted. Unhide - brings hidden ones back.\n"
+                               "Delete - removes the files for good (MO2: from the mod or Overwrite folder they are in).");
+            if (!ShowGroup("Presets Preset Hide Unhide Delete Hidden")) {
+                return;
+            }
+            struct Row
+            {
+                std::string file;    // as on disk
+                std::string name;    // without .jslot / .hidden
+                bool        hidden;
+            };
+            std::vector<Row> rows;
+            for (const auto& f : a_snap.lists->presets) {
+                rows.push_back({ f, f.size() > 6 ? f.substr(0, f.size() - 6) : f, false });
+            }
+            for (const auto& f : a_snap.lists->hiddenPresets) {
+                const auto pos = f.find(".jslot");
+                rows.push_back({ f, pos == std::string::npos ? f : f.substr(0, pos), true });
+            }
+            std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) { return _stricmp(x.name.c_str(), y.name.c_str()) < 0; });
+            // ticks of files that are gone (renamed / deleted) are dropped
+            std::erase_if(g_presetSel, [&](const std::string& f) { return std::none_of(rows.begin(), rows.end(), [&](const Row& r) { return r.file == f; }); });
+
+            // followers using a (shown) preset
+            auto usersOf = [&](const Row& r) {
+                std::string users;
+                if (!r.hidden) {
+                    for (int i = 0; i < static_cast<int>(a_snap.slots.size()); ++i) {
+                        if (a_snap.slots[i].Active() && a_snap.slots[i].preset == r.name) {
+                            users += (users.empty() ? "" : ", ") + SlotLabel(a_snap.slots[i], i);
+                        }
+                    }
+                }
+                return users;
+            };
+
+            SetNextItemWidth(340.0f);
+            InputTextWithHint("##presetsearch", "Search presets...", g_presetSearch.data(), g_presetSearch.size());
+            if (g_presetSearch[0]) {
+                SameLine();
+                if (SmallButton("x##clearpresets")) {
+                    g_presetSearch[0] = '\0';
+                }
+            }
+            const auto count = std::format("{} of {} selected", g_presetSel.size(), rows.size());
+            NextToWidth(CalcTextSize(count.c_str()).x);
+            AlignTextToFramePadding();
+            TextUnformatted(count.c_str());
+            // the result of the last Hide / Unhide / Delete, next to the count (user)
+            if (!g_presetNotice.empty()) {
+                NextToWidth(CalcTextSize(g_presetNotice.c_str()).x);
+                AlignTextToFramePadding();
+                TextColored(g_presetNoticeError ? kErrorRed : kValueBlue, "%s", g_presetNotice.c_str());  // like DrawNotice
+            }
+
+            // the ticked ones, split by what each menu entry can do
+            std::vector<const Row*> toHide, toUnhide, toDelete;
+            std::string             users;
+            for (const auto& r : rows) {
+                if (!g_presetSel.contains(r.file)) {
+                    continue;
+                }
+                toDelete.push_back(&r);
+                (r.hidden ? toUnhide : toHide).push_back(&r);
+                if (const auto u = usersOf(r); !u.empty()) {
+                    users += std::format("\n  {}: {}", r.name, u);
+                }
+            }
+            auto names = [](const std::vector<const Row*>& a_list) {
+                std::string out;
+                for (std::size_t i = 0; i < a_list.size() && i < 12; ++i) {
+                    out += "\n  " + a_list[i]->name;
+                }
+                if (a_list.size() > 12) {
+                    out += std::format("\n  ... and {} more", a_list.size() - 12);
+                }
+                return out;
+            };
+            const std::string usedBy = users.empty() ? std::string{} : "\nUsed by followers (their look needs the preset when they load again):" + users;
+
+            std::vector<const Row*> shown;
+            for (const auto& r : rows) {
+                if (Contains(r.name, g_presetSearch.data())) {
+                    shown.push_back(&r);
+                }
+            }
+            if (rows.empty()) {
+                TextDisabled("No presets in CharGen/Exported");
+            } else if (int presetRows = LF::PresetRows();  // the saved value (the grip saves each change)
+                       BeginListTable("##presets", 3, std::max<std::size_t>(shown.size(), 1), GetFrameHeight(), 280.0f + 70.0f + 220.0f,
+                           static_cast<std::size_t>(presetRows))) {
+                TableSetupColumn("Preset", ImGuiTableColumnFlags_WidthFixed, 280.0f);
+                TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                TableSetupColumn("Used by", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+                static ColumnWidths s_cols;  // NG (user): resizable like the Nearby Actors table, widths kept
+                KeepColumnWidths(s_cols, LF::PresetWidths, LF::SetPresetWidths);
+                TableHeadersRow();
+                ImVec4 grey{ 0.5f, 0.5f, 0.5f, 1.0f };
+                if (auto c = GetStyleColorVec4(ImGuiCol_TextDisabled)) {
+                    grey = *c;
+                }
+                for (auto* r : shown) {
+                    PushID(r->file.c_str());
+                    if (r->hidden) {
+                        PushStyleColor(ImGuiCol_Text, grey);  // NG (user): a hidden preset's whole row greyed out (still tickable)
+                    }
+                    TableNextRow();
+                    TableNextColumn();
+                    bool on = g_presetSel.contains(r->file);
+                    if (Checkbox(r->name.c_str(), &on)) {
+                        if (on) {
+                            g_presetSel.insert(r->file);
+                        } else {
+                            g_presetSel.erase(r->file);
+                        }
+                    }
+                    TableNextColumn();
+                    AlignTextToFramePadding();
+                    TextUnformatted(r->hidden ? "Hidden" : "Shown");
+                    TableNextColumn();
+                    AlignTextToFramePadding();
+                    TextUnformatted(usersOf(*r).c_str());
+                    if (r->hidden) {
+                        PopStyleColor();
+                    }
+                    PopID();
+                }
+                if (shown.empty()) {
+                    TableNextRow();
+                    TableNextColumn();
+                    TextDisabled("No match for \"%s\"", g_presetSearch.data());
+                }
+                if (TableGetHoveredColumn() >= 0 && IsMouseClicked(ImGuiMouseButton_Right)) {
+                    OpenPopup("##presetctx");
+                }
+                if (BeginPopup("##presetctx")) {
+                    if (Selectable("Select all shown")) {
+                        for (auto* r : shown) {
+                            g_presetSel.insert(r->file);
+                        }
+                    }
+                    if (Selectable("Select none")) {
+                        g_presetSel.clear();
+                    }
+                    Separator();
+                    const auto hideLabel = std::format("Hide ({})", toHide.size());
+                    if (Selectable(hideLabel.c_str(), false, toHide.empty() ? ImGuiSelectableFlags_Disabled : 0)) {
+                        g_presetAsk = 1;
+                    }
+                    Tooltip(toHide.empty() ? "Tick shown presets first." : "Renames the ticked presets' .jslot, .dds tint and .nif head mesh to <file>.hidden.");
+                    const auto unhideLabel = std::format("Unhide ({})", toUnhide.size());
+                    if (Selectable(unhideLabel.c_str(), false, toUnhide.empty() ? ImGuiSelectableFlags_Disabled : 0)) {
+                        int done = 0;
+                        for (auto* r : toUnhide) {
+                            std::string err;
+                            if (Files::UnhidePreset(r->file, err)) {
+                                ++done;
+                            } else {
+                                logger::warn("Unhide {}: {}", r->name, err);
+                            }
+                        }
+                        PresetNotice(PresetResult(done, toUnhide.size(), "unhidden"), done != static_cast<int>(toUnhide.size()));
+                        g_presetSel.clear();
+                        LF::RebuildLists();
+                    }
+                    Tooltip(toUnhide.empty() ? "Tick hidden presets first." : "Renames the ticked hidden presets back to .jslot (and their .dds tint / .nif head mesh).");
+                    const auto deleteLabel = std::format("Delete ({})", toDelete.size());
+                    if (Selectable(deleteLabel.c_str(), false, toDelete.empty() ? ImGuiSelectableFlags_Disabled : 0)) {
+                        g_presetAsk = 2;
+                    }
+                    Tooltip(toDelete.empty() ? "Tick presets first." : "Deletes the ticked presets for good (.jslot + .dds tint + .nif head mesh).");
+                    EndPopup();
+                }
+                EndTable();
+                ListTableGrip("##presetgrip", presetRows, std::max<std::size_t>(shown.size(), 1), GetFrameHeight(), LF::SetPresetRows);
+            }
+
+            // the menu's Hide / Delete ask first (opened here, outside the menu popup, at the dialogs' own ID level)
+            if (g_presetAsk == 1) {
+                OpenPopup("Hide presets##presetHideDlg");
+            } else if (g_presetAsk == 2) {
+                OpenPopup("Delete presets##presetDeleteDlg");
+            }
+            g_presetAsk = 0;
+            if (ConfirmDialog("Hide presets##presetHideDlg",
+                    std::format("Hide {} preset(s)? Their .jslot, .dds and .nif get \".hidden\" added (nothing is deleted).{}{}", toHide.size(), names(toHide), usedBy))) {
+                int done = 0;
+                for (auto* r : toHide) {
+                    done += Files::HidePreset(r->file) ? 1 : 0;
+                }
+                PresetNotice(PresetResult(done, toHide.size(), "hidden"), done != static_cast<int>(toHide.size()));
+                g_presetSel.clear();
+                LF::RebuildLists();
+            }
+            if (ConfirmDialog("Delete presets##presetDeleteDlg",
+                    std::format("DELETE {} preset(s) for good? Their .jslot, .dds and .nif are removed - this can't be undone\n"
+                                "(Hide keeps them instead).{}{}",
+                        toDelete.size(), names(toDelete), usedBy))) {
+                int done = 0;
+                for (auto* r : toDelete) {
+                    std::string err;
+                    if (Files::DeletePreset(r->file, err)) {
+                        ++done;
+                    } else {
+                        logger::warn("Delete {}: {}", r->name, err);
+                    }
+                }
+                PresetNotice(PresetResult(done, toDelete.size(), "deleted"), done != static_cast<int>(toDelete.size()));
+                g_presetSel.clear();
+                LF::RebuildLists();
+            }
+        }
+
         void __stdcall RenderSettings()
         {
             const bool opened = NoteDrawn(4);
+            if (opened) {
+                g_presetNotice.clear();  // NG (user): the Presets result goes away once the menu was closed
+            }
             BeginPage("settings", true);
             auto snapOpt = Ready();
             if (!snapOpt) {
@@ -1609,10 +2190,10 @@ namespace Menu
 
             DrawNotice();
 
-            DrawNearbyActors(snap);
+            DrawNearbyActors(snap, opened);
 
             Section("RaceMenu", kModesTip);
-            GlobalSlider("Apply Delay", LF::Global::kDelay, 0, 10, "%d sec", "Seconds to wait after a follower loads before applying its appearance.");
+            // NG (user): Apply Delay removed (a load pass waits for the follower's 3D itself; fixed 1 s after it loads)
             // NG (user): RM Full Mode + RM Lite Mode merged into one setting
             GlobalSlider("RaceMenu Mode", LF::Global::kLiteMode, 0, 15, "%d",
                 (std::string("RaceMenu flags for every preset apply: Apply Settings / Apply to All / NPC Preset and whenever a follower loads.\n"
@@ -1653,6 +2234,8 @@ namespace Menu
                 }
             }
 
+            DrawHidePreset(snap);
+
             Section("NPC Data", "Followers' name, preset, race, voice, sex, style, class, spells and worn gear.");
             if (Show("Load All NPCs Save All NPCs to One File Save Each NPC Separately")) {
                 if (std::filesystem::exists(Files::NPCFile(), ec)) {
@@ -1673,45 +2256,51 @@ namespace Menu
                 }
             }
 
-            // NG 1.1 (user): hotkey for the Lazy Followers window (as Actor Control's)
+            // NG 1.1 (user): hotkeys for the Lazy Followers window (as Actor Control's) and Summon Follower
             Section("Hotkey", "Keys are read from Windows, so they also work over other menus.\n"
                               "Click the key button, then press a key (Ctrl / Shift / Alt held with it count). Esc cancels.");
-            if (BeginRow("Open Window", "Opens / closes the Lazy Followers pages in a window of their own (tabs),\n"
-                                        "without opening the SKSE menu. Esc or the window's X closes it.")) {
-                const auto  key = LF::OpenWindowKey();
-                const bool  capturing = Hotkey::Capturing();
-                const auto  label = capturing ? std::string("Press a key...") : Hotkey::Name(key);
-                if (Button((label + "###openkey").c_str(), ImVec2{ g_rowWidth, 0.0f })) {
-                    if (capturing) {
-                        Hotkey::CancelCapture();
-                    } else {
-                        Hotkey::BeginCapture();
-                    }
-                }
-                if (EndRow(!key.IsSet(), "No key (the default)")) {
-                    Hotkey::CancelCapture();
-                    LF::SetOpenWindowKey({});
-                }
+            if (static bool fixed = false; !fixed && LF::InGame()) {
+                Hotkey::FixShared();  // one key per hotkey (older settings files)
+                fixed = true;
             }
+            HotkeyRow("Open Window", "Opens / closes the Lazy Followers pages in a window of their own (tabs),\n"
+                                     "without opening the SKSE menu. Esc or the window's X closes it.",
+                Hotkey::Key::kOpenWindow, LF::OpenWindowKey(), LF::SetOpenWindowKey);
+            HotkeyRow("Summon Follower", "Summons the follower selected on the Followers page to you (like Summon NPC).\n"
+                                         "No follower selected yet: the first one in the Follower list.",
+                Hotkey::Key::kSummon, LF::SummonKey(), LF::SetSummonKey);
+            HotkeyRow("Summon All", "Summons every follower that is not following you (like the Summon All button).",
+                Hotkey::Key::kSummonAll, LF::SummonAllKey(), LF::SetSummonAllKey);
+            HotkeyRow("Save Player Preset", "Asks for a name, then saves YOUR look as a preset (like the console's skee preset-save <name>):\n"
+                                            "the .jslot + the face tint .dds in the CharGen Exported folders, so it shows in the Preset list.\n"
+                                            "Enter saves, Esc cancels.",
+                Hotkey::Key::kSavePreset, LF::SavePresetKey(), LF::SetSavePresetKey);
+            HotkeyRow("Open Inventory", "Opens the inventory of the NPC ticked in Nearby Actors (take / give items, like a follower's trade\n"
+                                        "window - any living NPC near you). A new console selection, or a new NPC looked at while nothing is\n"
+                                        "selected in the console, is ticked first. You ticked: your own inventory. The Nearby Actors window\n"
+                                        "stays open - tick another actor there to switch. Closes the Lazy Followers window first.",
+                Hotkey::Key::kOpenInventory, LF::OpenInventoryKey(), LF::SetOpenInventoryKey);
+            HotkeyRow("Nearby Actors Window", "Opens / closes Nearby Actors (scan, the actor list, Save Actor Preset) in a small window of its own,\n"
+                                              "without the SKSE menu. Opening it scans once. Esc or the window's X closes it.",
+                Hotkey::Key::kNearbyWindow, LF::NearbyWindowKey(), LF::SetNearbyWindowKey);
 
             Section("Logging");
-            static constexpr const char* kTrace[] = { "Console + log file", "Log file only", "Errors only" };
-            if (BeginRow("Logging Mode", "Console = messages also in the game console.\nLog: Documents/My Games/Skyrim Special Edition/SKSE/LazyFollowersNG.log")) {
-                const int cur = std::clamp(LF::GetGlobal(LF::Global::kTrace), 0, 2);
-                if (BeginSolidCombo("##v", kTrace[cur], g_rowWidth)) {
-                    for (int i = 0; i < 3; ++i) {
-                        if (Selectable(kTrace[i], i == cur)) {
-                            LF::SetGlobal(LF::Global::kTrace, i);
-                        }
-                    }
-                    EndCombo();
+            // NG (user): a toggle instead of the Logging Mode drop-down. On = everything in the log file (global 1),
+            // off = warnings and errors only (global 2). The old "Console + log file" (0) counts as on.
+            if (BeginRow("Logging", "On: everything Lazy Followers does goes into the log file.\nOff: only warnings and errors.\n"
+                                    "Log: Documents/My Games/Skyrim Special Edition/SKSE/LazyFollowersNG.log")) {
+                bool v = LF::GetGlobal(LF::Global::kTrace) < 2;
+                bool changed = Checkbox("##v", &v);
+                if (EndRow(v == (LF::GlobalDefault(LF::Global::kTrace) < 2))) {
+                    v = LF::GlobalDefault(LF::Global::kTrace) < 2;
+                    changed = true;
                 }
-                if (EndRow(cur == LF::GlobalDefault(LF::Global::kTrace))) {
-                    LF::SetGlobal(LF::Global::kTrace, LF::GlobalDefault(LF::Global::kTrace));
+                if (changed) {
+                    LF::SetGlobal(LF::Global::kTrace, v ? 1 : 2);
                 }
             }
 
-            if (ResetAllButton("Every value on this page (delay, RaceMenu mode, behaviour, logging, scan radius) back to its default.\n"
+            if (ResetAllButton("Every value on this page (RaceMenu mode, behaviour, logging, scan radius) back to its default.\n"
                                "Files, presets, followers and the hotkey are not touched.",
                     "Reset all settings to their defaults?")) {
                 LF::ResetSettings();
@@ -1723,6 +2312,20 @@ namespace Menu
 
     namespace
     {
+        // Opens / closes one of our windows. NG fix (Save Player Preset lock, found with Frida): a hotkey's key
+        // press can also reach the game as one of its controls (here Toggle POV) and the window then takes the key
+        // release - so on close the game's "Toggle POV held" state is released (LF::ResetPovHold).
+        void SetWindowOpen(SKSEMenuFramework::Model::WindowInterface* a_window, bool a_open)
+        {
+            if (!a_window) {
+                return;
+            }
+            const bool was = a_window->IsOpen.exchange(a_open);
+            if (was && !a_open) {
+                LF::ResetPovHold();
+            }
+        }
+
         SKSEMenuFramework::Model::WindowInterface* g_window = nullptr;  // the Lazy Followers window (AddWindow)
 
         // The Lazy Followers window, drawn every frame by SKSE Menu Framework while it is open: the five pages
@@ -1733,7 +2336,7 @@ namespace Menu
                 return;
             }
             if (IsKeyPressed(ImGuiKey_Escape, false) && !Hotkey::Capturing()) {
-                g_window->IsOpen.store(false);
+                SetWindowOpen(g_window, false);
                 return;
             }
             SetNextWindowPos(ImVec2{ 80.0f, 60.0f }, ImGuiCond_FirstUseEver);
@@ -1774,15 +2377,158 @@ namespace Menu
             }
             End();
             if (!open) {
-                g_window->IsOpen.store(false);
+                SetWindowOpen(g_window, false);
             }
         }
+    }
+
+    namespace
+    {
+        SKSEMenuFramework::Model::WindowInterface* g_saveWindow = nullptr;  // the Save Player Preset dialog (AddWindow)
+        std::array<char, 80>                       g_playerPresetName{};
+        bool                                       g_saveFocus = false;  // put the keyboard in the name box (just opened)
+        int                                        g_saveClosing = 0;    // frames left before the dialog really closes
+
+        // NG fix (user: "locked in place after Save Player Preset closes"): the name box still had the keyboard when
+        // the window closed, so ImGui's "wants text input" stayed on (it is only recomputed in a new frame, and
+        // SKSE Menu Framework stops making frames once no window is open) and the game's controls stayed blocked.
+        // Closing now takes the keyboard away from the box (ClearActiveID) and keeps the window up, drawing nothing,
+        // for 2 more frames so ImGui sees no text box any more; then it closes.
+        void CloseSaveWindow()
+        {
+            ClearActiveID();
+            g_saveClosing = 2;
+        }
+
+        // NG (user): the Save Player Preset dialog - a preset name, then RaceMenu's player save (LF::SavePreset on
+        // the player). Enter or Save saves, Esc or Cancel closes; warns when the name is taken.
+        void __stdcall RenderSaveWindow()
+        {
+            if (!g_saveWindow || !g_saveWindow->IsOpen.load()) {
+                return;
+            }
+            if (g_saveClosing > 0) {
+                if (--g_saveClosing == 0) {
+                    SetWindowOpen(g_saveWindow, false);
+                }
+                return;
+            }
+            if (IsKeyPressed(ImGuiKey_Escape, false) && !Hotkey::Capturing()) {
+                CloseSaveWindow();
+                return;
+            }
+            SetNextWindowPos(ImVec2{ 300.0f, 200.0f }, ImGuiCond_FirstUseEver);
+            if (g_saveFocus) {
+                SetNextWindowFocus();
+            }
+            bool open = true;
+            bool save = false;
+            if (Begin("Save Player Preset###LFNGSavePreset", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+                Text("Name for this preset (your current look):");
+                if (g_saveFocus) {
+                    SetKeyboardFocusHere();
+                    g_saveFocus = false;
+                }
+                SetNextItemWidth(320.0f);
+                save = InputTextWithHint("##name", "Preset name", g_playerPresetName.data(), g_playerPresetName.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+                const auto      file = Files::SafeFileName(g_playerPresetName.data());
+                std::error_code ec;
+                if (!file.empty() && std::filesystem::exists(Files::PresetFolder() / (file + ".jslot"), ec)) {
+                    TextColored(kErrorRed, "%s.jslot already exists - Save overwrites it.", file.c_str());
+                }
+                const bool can = !file.empty() && LF::InGame();
+                BeginDisabled(!can);
+                if (Button("Save", ImVec2{ 100.0f, 0.0f })) {
+                    save = true;
+                }
+                EndDisabled();
+                SameLine();
+                if (Button("Cancel", ImVec2{ 100.0f, 0.0f })) {
+                    open = false;
+                }
+                if (save && can) {
+                    LF::SavePreset(0x14, g_playerPresetName.data(), true);  // 0x14 = the player
+                    open = false;
+                }
+            }
+            End();
+            if (!open) {
+                CloseSaveWindow();
+            }
+        }
+    }
+
+    namespace
+    {
+        SKSEMenuFramework::Model::WindowInterface* g_nearbyWindow = nullptr;  // the Nearby Actors window (AddWindow)
+
+        // NG (user): Nearby Actors in a window of its own (its hotkey): the same section as on the Settings page
+        // (scan, list, auto-ticked console selection / crosshair actor, Save Actor Preset). Opening it scans once;
+        // its X or Esc closes it.
+        void __stdcall RenderNearbyWindow()
+        {
+            if (!g_nearbyWindow || !g_nearbyWindow->IsOpen.load()) {
+                return;
+            }
+            if (IsKeyPressed(ImGuiKey_Escape, false) && !Hotkey::Capturing()) {
+                SetWindowOpen(g_nearbyWindow, false);
+                return;
+            }
+            SetNextWindowPos(ImVec2{ 120.0f, 120.0f }, ImGuiCond_FirstUseEver);
+            SetNextWindowSize(ImVec2{ 640.0f, 520.0f }, ImGuiCond_FirstUseEver);
+            bool open = true;
+            if (Begin("Nearby Actors###LFNGNearby", &open, ImGuiWindowFlags_NoCollapse)) {
+                const bool opened = NoteDrawn(5);
+                BeginPage("nearbywindow");
+                if (auto snap = Ready()) {
+                    if (opened) {
+                        LF::ScanNearby();
+                    }
+                    DrawNotice();
+                    DrawNearbyActors(*snap, opened);
+                }
+            }
+            End();
+            if (!open) {
+                SetWindowOpen(g_nearbyWindow, false);
+            }
+        }
+    }
+
+    void ToggleNearbyWindow()
+    {
+        if (g_nearbyWindow) {
+            SetWindowOpen(g_nearbyWindow, !g_nearbyWindow->IsOpen.load());
+        }
+    }
+
+    void OpenSavePresetDialog()
+    {
+        if (g_saveWindow && !g_saveWindow->IsOpen.load()) {
+            g_playerPresetName.fill('\0');
+            g_saveFocus = true;
+            g_saveClosing = 0;
+            g_saveWindow->IsOpen.store(true);
+        }
+    }
+
+    // The Open Inventory hotkey (UI task = main thread): the pick is brought up to date (UpdatePick with the live
+    // console selection / last actor looked at), the Lazy Followers window closes, then LF opens the ticked actor's
+    // inventory. NG (user): the Nearby Actors window stays open - tick another actor there to switch inventories.
+    void OpenPickedInventory()
+    {
+        const auto now = LF::PickRefs();
+        UpdatePick(now.console, now.crosshair, now.consoleBusy, !(g_nearbyWindow && g_nearbyWindow->IsOpen.load()));
+        if (g_window) {
+            SetWindowOpen(g_window, false);
+        }
+        LF::OpenInventory(g_pickRef);
     }
 
     void ToggleWindow()
     {
         if (g_window) {
-            g_window->IsOpen.store(!g_window->IsOpen.load());
+            SetWindowOpen(g_window, !g_window->IsOpen.load());
         }
     }
 
@@ -1799,6 +2545,8 @@ namespace Menu
         SKSEMenuFramework::AddSectionItem("Combat Styles", RenderStyles);
         SKSEMenuFramework::AddSectionItem("Settings", RenderSettings);
         g_window = SKSEMenuFramework::AddWindow(RenderWindow);  // opened by the Settings hotkey
+        g_saveWindow = SKSEMenuFramework::AddWindow(RenderSaveWindow);  // opened by the Save Player Preset hotkey
+        g_nearbyWindow = SKSEMenuFramework::AddWindow(RenderNearbyWindow);  // opened by the Nearby Actors Window hotkey
         logger::info("Registered with SKSE Menu Framework {:.2f}", SKSEMenuFramework::GetMenuFrameworkVersion());
     }
 }

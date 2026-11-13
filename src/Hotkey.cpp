@@ -1,8 +1,13 @@
-// Hotkey - the "Open Window" hotkey of the Settings page (NG 1.1, user). Like Actor Control: the keyboard is
-// read straight from Windows (GetAsyncKeyState) on its own thread ~100 times a second, so it works over any
-// menu; the key is stored as a Windows virtual key + Ctrl / Shift / Alt. Pressing it opens / closes the
-// Lazy Followers window (Menu::ToggleWindow, run as a UI task). Binding: the Settings page's key button
-// starts a capture; the next key pressed (with the Ctrl / Shift / Alt held then) is bound, Esc cancels.
+// Hotkey - the Settings page's hotkeys (NG 1.1, user): "Open Window", "Summon Follower", "Summon All", "Save Player Preset",
+// "Open Inventory", "Nearby Actors Window". Like Actor
+// Control: the keyboard is read straight from Windows (GetAsyncKeyState) on its own thread ~100 times a
+// second, so it works over any menu; a key is stored as a Windows virtual key + Ctrl / Shift / Alt. Open
+// Window opens / closes the Lazy Followers window (Menu::ToggleWindow, run as a UI task); Summon Follower
+// summons the follower selected in the pages (LF::SummonSelected), Summon All every follower not following
+// (LF::SummonAll), Save Player Preset opens the name dialog (Menu::OpenSavePresetDialog), Open Inventory the inventory of the
+// actor ticked in Settings > Nearby Actors (Menu::OpenPickedInventory), Nearby Actors Window opens / closes that window
+// (Menu::ToggleNearbyWindow). One key per hotkey: binding a key takes it away from any other hotkey. Binding: a Settings key button starts a
+// capture; the next key pressed (with the Ctrl / Shift / Alt held then) is bound, Esc cancels.
 
 #include "Hotkey.h"
 
@@ -13,6 +18,7 @@ namespace Hotkey
     namespace
     {
         std::atomic<bool> g_capturing{ false };
+        std::atomic<Key>  g_captureFor{ Key::kOpenWindow };  // which hotkey the capture binds
         std::atomic<bool> g_capturePrimed{ false };  // first read of a capture done (keys already held are ignored)
 
         // Skyrim is the foreground window (no hotkeys while alt-tabbed).
@@ -77,28 +83,74 @@ namespace Hotkey
 
         std::array<bool, 256> g_prev{};  // poll thread only: last poll's key states
 
-        // One poll: binding capture while the Settings page waits for a key, else the hotkey.
+        // Every hotkey, in the Settings page's row order: its name and where it is stored.
+        struct Entry
+        {
+            Key         key;
+            const char* name;
+            LF::KeyBinding (*get)();
+            void (*set)(LF::KeyBinding);
+        };
+        constexpr Entry kEntries[] = {
+            { Key::kOpenWindow, "Open Window", LF::OpenWindowKey, LF::SetOpenWindowKey },
+            { Key::kSummon, "Summon Follower", LF::SummonKey, LF::SetSummonKey },
+            { Key::kSummonAll, "Summon All", LF::SummonAllKey, LF::SetSummonAllKey },
+            { Key::kSavePreset, "Save Player Preset", LF::SavePresetKey, LF::SetSavePresetKey },
+            { Key::kOpenInventory, "Open Inventory", LF::OpenInventoryKey, LF::SetOpenInventoryKey },
+            { Key::kNearbyWindow, "Nearby Actors Window", LF::NearbyWindowKey, LF::SetNearbyWindowKey },
+        };
+
+        bool Same(const LF::KeyBinding& a_a, const LF::KeyBinding& a_b) { return a_a.vk == a_b.vk && a_a.mods == a_b.mods; }
+
+        // NG (user: "fix being able to have the same hotkey for everything"): a_key now has a_binding - every other
+        // hotkey with the same key + Ctrl / Shift / Alt loses it (set to none). Returns the names cleared.
+        std::string TakeKey(Key a_key, const LF::KeyBinding& a_binding)
+        {
+            std::string cleared;
+            for (const auto& e : kEntries) {
+                if (e.key != a_key && a_binding.IsSet() && Same(e.get(), a_binding)) {
+                    e.set({});
+                    cleared += (cleared.empty() ? "" : ", ") + std::string(e.name);
+                }
+            }
+            return cleared;
+        }
+
+        // A binding the poll can read (set, a virtual key below 256).
+        bool Usable(const LF::KeyBinding& a_b) { return a_b.IsSet() && a_b.vk < 256; }
+
+        // One poll: binding capture while the Settings page waits for a key, else the hotkeys.
         void Poll()
         {
             if (!GameHasFocus()) {
                 g_prev.fill(false);
                 return;
             }
-            // NG perf: every key only while picking a key; otherwise just the bound key + Ctrl / Shift / Alt
+            // NG perf: every key only while picking a key; otherwise just the bound keys + Ctrl / Shift / Alt
             std::array<bool, 256> now{};
-            const auto            b = LF::OpenWindowKey();
+            const auto            open = LF::OpenWindowKey();
+            const auto            summon = LF::SummonKey();
+            const auto            summonAll = LF::SummonAllKey();
+            const auto            savePreset = LF::SavePresetKey();
+            const auto            openInv = LF::OpenInventoryKey();
+            const auto            nearbyWin = LF::NearbyWindowKey();
             const bool            capturing = g_capturing.load();
             if (capturing) {
                 for (int vk = 1; vk < 256; ++vk) {
                     now[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
                 }
             } else {
-                if (!b.IsSet() || b.vk >= 256) {
+                if (!Usable(open) && !Usable(summon) && !Usable(summonAll) && !Usable(savePreset) && !Usable(openInv) && !Usable(nearbyWin)) {
                     g_prev.fill(false);
                     return;
                 }
-                for (int vk : { static_cast<int>(b.vk), VK_CONTROL, VK_SHIFT, VK_MENU }) {
+                for (int vk : { VK_CONTROL, VK_SHIFT, VK_MENU }) {
                     now[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                }
+                for (const auto& b : { open, summon, summonAll, savePreset, openInv, nearbyWin }) {
+                    if (Usable(b)) {
+                        now[b.vk] = (GetAsyncKeyState(static_cast<int>(b.vk)) & 0x8000) != 0;
+                    }
                 }
             }
             if (capturing) {
@@ -115,8 +167,17 @@ namespace Hotkey
                         break;
                     }
                     if (Bindable(vk)) {
-                        LF::SetOpenWindowKey({ static_cast<std::uint32_t>(vk), HeldMods(now) });
-                        logger::info("Open Window hotkey set to {}", Name(LF::OpenWindowKey()));
+                        const LF::KeyBinding k{ static_cast<std::uint32_t>(vk), HeldMods(now) };
+                        for (const auto& e : kEntries) {
+                            if (e.key == g_captureFor.load()) {
+                                const auto cleared = TakeKey(e.key, k);  // the key leaves any other hotkey first
+                                e.set(k);
+                                logger::info("{} hotkey set to {}{}", e.name, Name(k), cleared.empty() ? "" : " (taken from " + cleared + ")");
+                                if (!cleared.empty()) {
+                                    LF::SetNotice(std::format("{} now uses {} - removed from {}.", e.name, Name(k), cleared));
+                                }
+                            }
+                        }
                         g_capturing = false;
                         break;
                     }
@@ -127,10 +188,33 @@ namespace Hotkey
                 }
                 return;
             }
-            const bool pressed = now[b.vk] && !g_prev[b.vk] && HeldMods(now) == b.mods;
+            auto pressed = [&](const LF::KeyBinding& a_b) { return Usable(a_b) && now[a_b.vk] && !g_prev[a_b.vk] && HeldMods(now) == a_b.mods; };
+            const bool openPressed = pressed(open);
+            const bool summonPressed = pressed(summon);
+            const bool summonAllPressed = pressed(summonAll);
+            const bool savePresetPressed = pressed(savePreset);
+            const bool openInvPressed = pressed(openInv);
+            const bool nearbyWinPressed = pressed(nearbyWin);
             g_prev = now;
-            if (pressed && Allowed()) {
-                SKSE::GetTaskInterface()->AddUITask([]() { Menu::ToggleWindow(); });
+            if ((openPressed || summonPressed || summonAllPressed || savePresetPressed || openInvPressed || nearbyWinPressed) && Allowed()) {
+                if (openPressed) {
+                    SKSE::GetTaskInterface()->AddUITask([]() { Menu::ToggleWindow(); });
+                }
+                if (summonPressed) {
+                    LF::SummonSelected();
+                }
+                if (summonAllPressed) {
+                    LF::SummonAll(true);
+                }
+                if (savePresetPressed) {
+                    SKSE::GetTaskInterface()->AddUITask([]() { Menu::OpenSavePresetDialog(); });
+                }
+                if (openInvPressed) {
+                    SKSE::GetTaskInterface()->AddUITask([]() { Menu::OpenPickedInventory(); });
+                }
+                if (nearbyWinPressed) {
+                    SKSE::GetTaskInterface()->AddUITask([]() { Menu::ToggleNearbyWindow(); });
+                }
             }
         }
     }
@@ -150,11 +234,26 @@ namespace Hotkey
                 }
             }
         }).detach();
-        logger::info("Hotkey reader started (Open Window: {})", Name(LF::OpenWindowKey()));
+        logger::info("Hotkey reader started (Open Window: {}, Summon Follower: {}, Summon All: {}, Save Player Preset: {}, Open Inventory: {}, Nearby Actors Window: {})",
+            Name(LF::OpenWindowKey()), Name(LF::SummonKey()), Name(LF::SummonAllKey()), Name(LF::SavePresetKey()), Name(LF::OpenInventoryKey()),
+            Name(LF::NearbyWindowKey()));
     }
 
-    void BeginCapture()
+    // NG (user): a settings file from before "one key per hotkey" can give one key to several hotkeys - the first row
+    // keeps it. Called by the Settings page's Hotkey section once a game is loaded (saving the settings file before
+    // that would write the game settings' defaults).
+    void FixShared()
     {
+        for (const auto& e : kEntries) {
+            if (const auto cleared = TakeKey(e.key, e.get()); !cleared.empty()) {
+                logger::info("{} was also on {} - kept on {} only", Name(e.get()), cleared, e.name);
+            }
+        }
+    }
+
+    void BeginCapture(Key a_key)
+    {
+        g_captureFor = a_key;
         g_capturePrimed = false;
         g_capturing = true;
     }
@@ -162,6 +261,8 @@ namespace Hotkey
     void CancelCapture() { g_capturing = false; }
 
     bool Capturing() { return g_capturing.load(); }
+
+    bool Capturing(Key a_key) { return g_capturing.load() && g_captureFor.load() == a_key; }
 
     // The key's name from Windows (its scan code's key name), with Ctrl / Shift / Alt in front.
     std::string Name(const LF::KeyBinding& a_binding)

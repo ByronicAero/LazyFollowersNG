@@ -27,12 +27,12 @@ namespace LF
 
     // A follower slot (one of the 100 actors). Empty preset = unused slot, like the scripts' myPreset == "".
     // female = the sex in use (NG: set from the applied preset, any slot can be male or female);
-    // defaultFemale = the esp's, restored by Reset / Dismiss.
+    // defaultFemale = the esp's, restored by Remove.
     struct Slot
     {
         RE::FormID  ref = 0;         // the slot's actor reference (ACHR in LazyFollowers.esp)
         RE::FormID  base = 0;        // its base NPC (shown in the Follower drop-down)
-        std::string defaultName;     // the esp values, restored by Reset / Dismiss
+        std::string defaultName;     // the esp values, restored by Remove
         RE::FormID  defaultRace = 0;
         RE::FormID  defaultVoice = 0;
         RE::FormID  defaultStyle = 0;
@@ -49,7 +49,29 @@ namespace LF
         RE::FormID              npcClass = 0;
         std::vector<RE::FormID> spells;
         bool                    added = false;  // NG: in the Followers list (Add Follower) but no preset applied yet
+        bool                    keep = false;   // NG (user): "Keep in New Game" - written to the keep file, back in a new game
+        bool                    preSummon = false;  // NG (user): "Pre Summon" - a new game brings the kept follower to the player
+        std::string             erinPreset;  // NG (user): Erin race extra preset "<file>.ini" in Data/SKSE/Plugins/ErinRace/Preset ("" = none)
+        // NG 1.2 (user, like PROTEUS): a real NPC of the game (e.g. Sofia) instead of a Lazy Followers slot actor -
+        // made by Apply Settings when a slot gets a modded voice whose own NPC is in the game. It gets preset, race
+        // and sex (and a nickname if one is applied later) - it keeps its own voice, name, dialogue, scripts and
+        // follower quest. ref = 0: free entry. Defaults = the NPC's own values when it was added (Remove).
+        bool real = false;
+        RE::FormID defaultSkin = 0;  // NG 1.2: a real NPC's own skin (WNAM), off while it has a preset (ApplyRealSkin)
+        RE::FormID defaultHair = 0;   // NG 1.2: the base NPC's own hair colour form (Remove; real NPCs: RestoreHeadData)
+        bool       moddedVoice = false;  // NG 1.2: snapshot only - a real NPC whose own voice is modded (e.g. Sofia: the Override box is shown)
+        RE::FormID defaultOutfit = 0;  // NG 1.2: its own default outfit (DOFT), off while it has a preset (it wears the follower's gear)
         std::map<std::string, float> statDefaults;  // NG: Stats page values changed -> their value before (Reset)
+        // NG (SKSE source, PapyrusWornObject.cpp: SetDisplayName with force empties the name's message / quest link):
+        // a real NPC's own reference name data (ExtraTextDisplayData) from before it was taken over, put back exactly
+        // on give-back. textSaved = captured (ClaimReal; co-save RTXT).
+        bool         textSaved = false;
+        bool         textHad = false;      // it had a reference name at all (else the extra data is removed again)
+        std::string  textName;
+        RE::FormID   textMessage = 0;      // BGSMessage the name comes from (quest alias names)
+        RE::FormID   textQuest = 0;        // quest that owns the name
+        std::int32_t textInstance = -1;
+        float        textTemper = 1.0f;
 
         bool Active() const { return !preset.empty(); }
         bool Listed() const { return Active() || added; }  // shown in the Follower drop-down
@@ -70,10 +92,15 @@ namespace LF
         std::vector<Choice>      femaleVoices;  // _LazyFollowersFemaleVoices + voices met
         std::vector<Choice>      maleVoices;
         std::vector<Choice>      otherVoices;   // NG: every other voice type of the load order (modded voices...)
+        std::unordered_set<RE::FormID> ownedVoices;  // NG (user): modded voices a unique NPC of the game uses (e.g. Sofia's) - the Override box shows for them
         std::vector<Choice>      classes;       // _LazyFollowersClasses
         std::vector<Choice>      spells;        // _LazyFollowersSpells (+ all playable spells when loaded)
         std::vector<std::string> presets;       // Data/SKSE/Plugins/CharGen/Exported/*.jslot
+        std::unordered_map<std::string, RE::FormID> presetRaces;  // NG (user): "<name>.jslot" -> the race it was made for (only known ones)
+        std::vector<std::string> hiddenPresets; // NG: the same folder's *.jslot.hidden (Settings > Presets > Unhide)
         std::vector<std::string> npcPresets;    // Data/SKSE/Plugins/LazyFollowers/LazyFollowersNPCs/*.json
+        std::vector<std::string> erinPresets;   // NG (user): Data/SKSE/Plugins/ErinRace/Preset/*.ini - empty when the Erin race is not installed
+        std::unordered_set<RE::FormID> erinRaces;  // NG (user): the Erin races (ErinRace.esm / editor ID "ErinRace...") - Erin Preset shows only for them
     };
 
     constexpr int kStatCount = 12;   // WeaponSpeedMult ... MagickaRate (Stats page, left column)
@@ -91,6 +118,7 @@ namespace LF
         float       selDistance = -1.0f;  // NG: the selected follower's distance to you in metres (-1 = not near you)
         std::string selLocation;          // NG: its location / cell / worldspace ("" = unknown)
         RE::FormID  consoleRef = 0;    // console-selected actor (0 = none)
+        bool        consoleBusy = false;  // NG: anything selected in the console (then the crosshair does not pick)
         RE::FormID  crosshairRef = 0;  // last actor under the crosshair (0 = none)
         bool        raceMenu = false;  // CharGen script found (RaceMenu installed)
         bool        fgt = false;       // Follower Goes on a Trip installed
@@ -112,7 +140,10 @@ namespace LF
     void InstallSinks();       // kDataLoaded: crosshair + 3D loaded events
     void RegisterCosave();     // SKSEPluginLoad
     void OnGameLoaded();       // kPostLoadGame / kNewGame
+    void OnNewGame();          // kNewGame: OnGameLoaded + Keep in New Games waits for RaceMenu to close
+    void OnGameSaved();        // kSaveGame: Keep in New Games file
     void OnLeaveGame();        // kPreLoadGame
+    void InitErin();           // kPostPostLoad: the Erin race's interface (MuErinRace.dll), for Erin Preset
     bool InGame();
 
     // ---- menu ----
@@ -120,9 +151,13 @@ namespace LF
     std::shared_ptr<const Snapshot> GetSnapshot();     // the latest snapshot (rebuilt at most ~10 times a second)
     int                      SlotCount();
     void                     OnFollowersPageOpened();  // the MCM's OnConfigOpen: crosshair NPC -> select / add race + voice
-    int                      TakeSelect();             // slot to select (from OnFollowersPageOpened / a load), -1 = none
+    int                      TakeSelect(bool* a_moved = nullptr);  // slot to select (from OnFollowersPageOpened / a load), -1 = none; a_moved: a take-over / give-back moved the follower there
     unsigned                 GameLoads();              // counts loads / new games (menu: forget unapplied edits)
     void                     AddFollower();            // NG: first unlisted slot -> Followers list, selected
+    constexpr int            kRealSlots = 20;          // NG 1.2: real NPC entries (after the esp's slots, see Apply)
+    // NG 1.2: a_ref is a real NPC entry with a preset and a nickname: its original name and the nickname
+    // (subtitles, Voice.cpp). Any thread.
+    bool Nickname(RE::FormID a_ref, std::string& a_from, std::string& a_to);
     void                     RebuildLists();
     std::string              Notice(bool& a_error);
     void                     ClearNotice();
@@ -131,15 +166,16 @@ namespace LF
     // ---- settings (globals live in the esp + save; the rest in the co-save) ----
     enum class Global
     {
-        kDelay,     // _LazyFollowersRMDelay: seconds after an NPC loads before the preset is applied
+        kDelay,     // _LazyFollowersRMDelay: no longer used (NG, user: Apply Delay removed; fixed 1 s, see ScheduleUpdate)
         kFullMode,  // _LazyFollowersRMFullMode: no longer used (NG: merged into RaceMenu Mode, user)
         kLiteMode,  // _LazyFollowersRMLiteMode: "RaceMenu Mode" - flags for every preset apply
-        kTrace,     // _LazyFollowersTraceMode: 0 console, 1 log file, 2 off
+        kTrace,     // _LazyFollowersTraceMode: Logging toggle - 1 (or the old 0) on, 2 off = warnings / errors only
         kSandbox,   // _LazyFollowersSandboxEnable: idle followers sandbox (package condition)
         kCount
     };
     int  GetGlobal(Global a_g);
-    void SetGlobal(Global a_g, int a_value);
+    void SetGlobal(Global a_g, int a_value, bool a_save = true);  // a_save false: no file write (slider still dragged)
+    void SaveSettingsFile();                                       // writes the settings file now (slider released)
     int  GlobalDefault(Global a_g);
 
     bool StylesEnabled();
@@ -150,6 +186,10 @@ namespace LF
     void SetSpellsEnabled(bool a_on);
     bool AutoEquip();
     void SetAutoEquip(bool a_on);
+    bool IncludeEquipment();   // NG (user): Copy Kit copies the worn armor / weapons too (default on)
+    void SetIncludeEquipment(bool a_on);
+    void SetKeep(int a_slot, bool a_on);  // NG (user): Keep in New Game per follower (written at each save, back after RaceMenu)
+    void SetPreSummon(int a_slot, bool a_on);  // NG (user): with Keep in New Game - summoned to the player in the new game
     bool AllSpellsLoaded();
     constexpr float kDefaultScanRadius = 20.0f;
     constexpr int   kDefaultNearbyRows = 10;
@@ -160,6 +200,10 @@ namespace LF
     void  ResetSettings();     // Settings page "Reset All": every Settings value back to its default (not the hotkey)
     std::vector<float> NearbyWidths();  // Nearby Actors table column widths as the user dragged them (empty = default)
     void               SetNearbyWidths(const std::vector<float>& a_widths);
+    std::vector<float> PresetWidths();  // NG (user): Settings > Presets table column widths (empty = default)
+    void               SetPresetWidths(const std::vector<float>& a_widths);
+    int                PresetRows();    // ... and its rows before it scrolls (its grip)
+    void               SetPresetRows(int a_rows);
 
     // NG 1.1 (user): the Settings page's hotkey that opens / closes the Lazy Followers window. vk = Windows
     // virtual key (0 = none), mods = Ctrl / Shift / Alt that must be held with it.
@@ -174,6 +218,16 @@ namespace LF
     };
     KeyBinding OpenWindowKey();  // any thread
     void       SetOpenWindowKey(KeyBinding a_key);
+    KeyBinding SummonKey();      // NG (user): Summon hotkey - brings the follower selected in the pages to you
+    void       SetSummonKey(KeyBinding a_key);
+    KeyBinding SummonAllKey();   // NG (user): Summon All hotkey - every follower not following you (like Summon All)
+    void       SetSummonAllKey(KeyBinding a_key);
+    KeyBinding SavePresetKey();  // NG (user): Save Player Preset hotkey - name dialog, then RaceMenu's player save
+    void       SetSavePresetKey(KeyBinding a_key);
+    KeyBinding OpenInventoryKey();  // NG (user): Open Inventory hotkey - the inventory of the actor ticked in Nearby Actors
+    void       SetOpenInventoryKey(KeyBinding a_key);
+    KeyBinding NearbyWindowKey();   // NG (user): Nearby Actors Window hotkey - Nearby Actors in a window of its own
+    void       SetNearbyWindowKey(KeyBinding a_key);
     void       LoadEarlySettings();  // kPostLoad: the hotkey + table widths from the settings file (no game needed)
 
     // ---- follower actions (queued to the main thread) ----
@@ -183,16 +237,30 @@ namespace LF
         RE::FormID  race = 0;
         RE::FormID  voice = 0;
         std::string presetFile;  // "<name>.jslot"
+        bool        takeOver = false;  // NG 1.2 (user, option 3): a modded voice's own NPC becomes the follower (else voice only);
+                                       // on a taken-over real NPC: false = give it back, a slot follower gets its voice
+        bool        keep = false;      // NG (user): Keep in New Game ticked on the result (a new game's kept take-over)
+        bool        summon = true;     // NG (user): false = no summon after the apply (a kept take-over without Pre Summon)
+        int         tries = 0;         // NG: waits so far for the NPC's give-back to finish (Apply retries every 0.5 s)
+        std::string erinPreset;        // NG (user): Erin race extra preset "<file>.ini" ("" = none)
     };
-    void Apply(int a_slot, ApplyRequest a_req);    // the MCM's "Apply settings" (full preset apply)
+    void Apply(int a_slot, ApplyRequest a_req);
+    // NG (user): the voice's NPC is already the Override of a_holder (a taken-over real NPC entry): a_holder gives it
+    // back (its follower goes to a free slot with that voice, like unticking there), then a_slot takes it over with a_req.
+    void MoveOverride(int a_holder, int a_slot, ApplyRequest a_req);    // the MCM's "Apply settings" (full preset apply; NG 1.2: takeOver + modded voice -> its real NPC takes over)
     void SetStyle(int a_slot, int a_style);
     void SetClass(int a_slot, RE::FormID a_class);
     void Summon(int a_slot);
+    void SummonSelected();                         // the Summon hotkey: the pages' selected follower (else the first listed)
+    std::string_view InventoryMenuFor(RE::FormID a_ref);  // InventoryMenu for the player, else ContainerMenu
+    void ResetPovHold();                           // NG: a window closed - the game's "Toggle POV held" (fovSlideMode) off (its key release went to the window)
+    void OpenInventory(RE::FormID a_ticked, int a_tries = 0);  // NG (user): Open Inventory hotkey - the ticked actor (an open one is closed first)
+    RE::FormID InventoryOpenFor();                 // the actor whose inventory Open Inventory has open now (0 = none)
     void TeleportTo(int a_slot);
     void Dismiss(int a_slot);                      // reset + back to storage
     void CopyKit(int a_slot);                      // player's worn gear -> follower
     void RefreshAll();                             // "Apply to all": full preset re-apply on every follower
-    void SummonAll();
+    void SummonAll(bool a_notify = false);         // a_notify: also a HUD notification (Summon All hotkey)
     void SendTravel();                             // Follower Goes on a Trip
     void ToggleSpell(int a_slot, RE::FormID a_spell);
     void SetStat(int a_slot, const char* a_avName, float a_value);  // first change remembers the value before
@@ -221,7 +289,15 @@ namespace LF
     bool                     Scanning();
     std::vector<NearbyActor> Nearby();
     void                     AddNearby(RE::FormID a_ref);  // console / crosshair pick -> into the list (actors only)
+    struct PickNow
+    {
+        RE::FormID console = 0;      // console-selected actor (a non-actor pick keeps the last actor clicked there)
+        RE::FormID crosshair = 0;    // last actor looked at
+        bool       consoleBusy = false;  // anything selected in the console
+    };
+    PickNow PickRefs();  // main thread: the Nearby Actors pick sources right now
 
     // ---- Save Actor Preset (replaces "skee preset-save <name>"); a_ref = the ticked Nearby Actor ----
-    void SavePreset(RE::FormID a_ref, std::string a_name);
+    // The player: RaceMenu's own CharGen.SaveCharacter (the .jslot + the tint .dds). a_notify: also a HUD notification.
+    void SavePreset(RE::FormID a_ref, std::string a_name, bool a_notify = false);
 }
