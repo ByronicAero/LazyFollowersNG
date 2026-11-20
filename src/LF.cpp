@@ -413,6 +413,7 @@ namespace LF
         std::vector<PassState> g_passes;     // per slot
         std::vector<std::uint8_t> g_resetLook;  // per slot: next full pass first clears the preset (Apply Settings)
         std::vector<std::chrono::steady_clock::time_point> g_freshUntil;  // per slot: a full apply just finished on the loaded actor - lite passes until then skip the reload
+        std::vector<std::uint8_t> g_loadWait;  // per slot (g_lock): after a load its 3D was not there yet - WaitForLoad polls (109)
 
         // A chain step that waits a_seconds (main-thread timer), then lets the chain go on.
         Papyrus::Chain::Step WaitStep(float a_seconds)
@@ -833,10 +834,26 @@ namespace LF
             }
         }
 
+        // NG (ShowRaceMenu NPC, 2026-11-19): RaceMenu (the game's RaceSex Menu) is open - it may be editing a follower
+        // (ShowRaceMenu NPC), so no race / preset pass may run then (her 3D reload after a race change put the slot's
+        // old race + preset back ~1 s later). The race she has when it closes becomes the slot's (RaceMenuClosed).
+        bool RaceMenuOpen()
+        {
+            auto ui = RE::UI::GetSingleton();
+            return ui && ui->IsMenuOpen(RE::RaceSexMenu::MENU_NAME);
+        }
+
         void RefreshAppearance(int a_slot, bool a_full, bool a_playerFace = false, bool a_body = false, std::function<void()> a_then = {})
         {
             auto actor = ActorOf(a_slot);
             if (!actor) {
+                return;
+            }
+            if (RaceMenuOpen()) {
+                Out(std::format("{} - RaceMenu is open: no preset pass", DisplayName(actor)));
+                if (a_then) {
+                    a_then();
+                }
                 return;
             }
             Slot s;
@@ -1169,6 +1186,10 @@ namespace LF
                 }
             }
             if (actor->IsDisabled()) {
+                return;
+            }
+            if (RaceMenuOpen()) {  // NG: no re-apply (race, sex, preset) while RaceMenu may be editing her
+                Out(std::format("{} - RaceMenu is open: no update", DisplayName(actor)));
                 return;
             }
             ApplyBase(a_slot);
@@ -2711,6 +2732,53 @@ namespace LF
             }
         };
 
+        // Clears the slot's "waiting after a load" flag; true if it was set (main thread or event thread).
+        bool TakeLoadWait(int a_slot)
+        {
+            std::lock_guard lock(g_lock);
+            if (a_slot < 0 || a_slot >= static_cast<int>(g_loadWait.size()) || !g_loadWait[a_slot]) {
+                return false;
+            }
+            g_loadWait[a_slot] = 0;
+            return true;
+        }
+
+        constexpr int kLoadWaitTries = 240;  // 0.25 s each = 60 s
+
+        // (109) User (ShowRaceMenu NPC session 2026-11-17: Vicky, standing in the player's room when the save loaded,
+        // got no preset - no face tint, plain plugin face; Ciel, who walked in later, got hers): a follower whose 3D
+        // was not built yet when the load finished is checked every 0.25 s (60 s at most) and gets its preset pass
+        // once the 3D is there. Stops when the 3D-load event took over (flag cleared), she is disabled / gone, the
+        // time is up (a follower in another cell: her 3D-load event applies it later) or a new game is loaded.
+        void WaitForLoad(int a_slot, int a_tries)
+        {
+            After(0.25f, [a_slot, a_tries]() {
+                auto actor = ActorOf(a_slot);
+                std::string name;
+                {
+                    std::lock_guard lock(g_lock);
+                    if (a_slot >= static_cast<int>(g_loadWait.size()) || !g_loadWait[a_slot]) {
+                        return;  // its 3D-load event scheduled the pass
+                    }
+                    name = g_slots[a_slot].name;
+                }
+                if (actor && actor->Is3DLoaded()) {
+                    if (TakeLoadWait(a_slot)) {
+                        Out(std::format("{} - 3D ready {:.2f} s after the load - preset pass", name, (kLoadWaitTries - a_tries + 1) * 0.25f));
+                        ScheduleUpdate(a_slot, false);
+                    }
+                    return;
+                }
+                if (!actor || actor->IsDisabled() || a_tries <= 0) {
+                    TakeLoadWait(a_slot);
+                    Out(std::format("{} - 3D still not there after the load ({}) - its next 3D load applies the preset", name,
+                        !actor ? "no actor" : actor->IsDisabled() ? "disabled" : "60 s"));
+                    return;
+                }
+                WaitForLoad(a_slot, a_tries - 1);
+            });
+        }
+
         // A follower's 3D loaded = the actor script's OnLoad: update it after the apply delay.
         class LoadSink : public RE::BSTEventSink<RE::TESObjectLoadedEvent>
         {
@@ -2731,6 +2799,14 @@ namespace LF
                     }
                 }
                 if (i >= 0) {
+                    if (TakeLoadWait(i)) {
+                        std::string name;
+                        {
+                            std::lock_guard lock(g_lock);
+                            name = g_slots[i].name;
+                        }
+                        Out(std::format("{} - 3D-load event after the load - preset pass", name));
+                    }
                     if (i < static_cast<int>(g_fullOnLoad.size()) && g_fullOnLoad[i]) {
                         g_fullOnLoad[i] = 0;
                         ScheduleUpdate(i, true);  // Apply to All while it was not loaded
@@ -3000,13 +3076,55 @@ namespace LF
             });
         }
 
-        // RaceMenu (the game's RaceSex Menu) closed while a new game waits for its kept followers.
+        // NG (ShowRaceMenu NPC, 2026-11-19): RaceMenu closed - a follower whose race differs from her slot's race was
+        // given a new race in it (ShowRaceMenu NPC edits followers there): the slot takes it, so no later pass puts
+        // the old race back. Saved in the co-save and, Keep in New Game ticked, in the keep file at once. The preset
+        // name stays (ShowRaceMenu NPC saved the preset file). Main thread.
+        // NG 1.3.3: a_how = log text ("changed in RaceMenu" / "reset by ShowRaceMenu NPC").
+        void RaceMenuClosed(std::string_view a_how = "changed in RaceMenu")
+        {
+            if (!g_inGame.load()) {
+                return;
+            }
+            bool keep = false;
+            for (int i = 0; i < static_cast<int>(g_slots.size()); ++i) {
+                auto actor = ActorOf(i);
+                auto now = actor ? actor->GetRace() : nullptr;
+                if (!now || MuManaged(actor)) {
+                    continue;
+                }
+                std::string name;
+                RE::TESRace* old = nullptr;
+                {
+                    std::lock_guard lock(g_lock);
+                    auto&           s = g_slots[i];
+                    old = Lookup<RE::TESRace>(s.race);
+                    if (!s.Active() || !old || old == now) {
+                        continue;
+                    }
+                    s.race = now->GetFormID();
+                    keep = keep || s.keep;
+                    name = s.name;
+                }
+                Out(std::format("{} - race {}: {:08X} -> {:08X} {} (now the slot's race)", name, a_how, old->GetFormID(), now->GetFormID(), now->GetFormEditorID()));
+            }
+            if (keep && !g_keepPending.load()) {
+                WriteKeepFile();
+            }
+        }
+
+        // RaceMenu (the game's RaceSex Menu) closed: race changes made in it become the slots' races, and a new game
+        // that waits for its kept followers gets them.
         class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
         {
         public:
             RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
             {
-                if (a_event && !a_event->opening && g_keepPending.load() && a_event->menuName == RE::RaceSexMenu::MENU_NAME) {
+                if (!a_event || a_event->opening || a_event->menuName != RE::RaceSexMenu::MENU_NAME) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                OnMain([]() { RaceMenuClosed(); });
+                if (g_keepPending.load()) {
                     Out("Keep in New Game: RaceMenu closed - followers come back in 0.5 s");
                     After(0.5f, []() { TryRestoreKept(30); });
                 }
@@ -3100,6 +3218,22 @@ namespace LF
 
     bool FormsFound() { return g_formsFound; }
 
+    void RaceResetByShowRaceMenu()
+    {
+        OnMain([]() { RaceMenuClosed("reset by ShowRaceMenu NPC"); });
+    }
+
+    // NG 1.3.4: active slots only (a preset applied); free real-NPC entries have ref 0 and are skipped.
+    void ForEachFollowerPreset(const std::function<void(RE::FormID, const std::string&, const std::string&)>& a_fn)
+    {
+        std::lock_guard lock(g_lock);
+        for (const auto& s : g_slots) {
+            if (s.ref != 0 && s.Active()) {
+                a_fn(s.ref, s.preset, s.erinPreset);
+            }
+        }
+    }
+
     void InstallSinks()
     {
         static CrosshairSink cross;
@@ -3116,7 +3250,7 @@ namespace LF
         if (auto player = RE::PlayerCharacter::GetSingleton()) {
             player->AsBGSActorCellEventSource()->AddEventSink(&cell);
         }
-        static MenuSink menu;  // Keep in New Games: RaceMenu closed
+        static MenuSink menu;  // RaceMenu closed: slot races, Keep in New Games
         if (auto ui = RE::UI::GetSingleton()) {
             ui->AddEventSink<RE::MenuOpenCloseEvent>(&menu);
         }
@@ -3166,15 +3300,46 @@ namespace LF
             ApplyBase(i);
         }
         BuildLists();
+        {
+            std::lock_guard lock(g_lock);
+            g_loadWait.assign(g_slots.size(), 0);
+        }
         for (int i = 0; i < static_cast<int>(g_actors.size()); ++i) {
-            bool active = false;
+            bool        active = false;
+            std::string name;
             {
                 std::lock_guard lock(g_lock);
                 active = g_slots[i].Active();
+                name = g_slots[i].name;
             }
-            if (auto a = ActorOf(i); active && a && a->Is3DLoaded()) {
+            auto a = ActorOf(i);
+            if (!active) {
+                continue;
+            }
+            if (!a) {
+                Out(std::format("{} - no actor found at the load - no preset pass", name));
+                continue;
+            }
+            if (a->Is3DLoaded()) {
+                Out(std::format("{} - loaded with the game - preset pass", name));
                 ScheduleUpdate(i, false);
+                continue;
             }
+            // (109) 3D not built yet: wait for it - its 3D-load event may have come during the load (ignored then)
+            // or not at all. (110) Not only in a loaded cell: on the first load after a game start the player's cell
+            // is not attached yet at this point (user 11:59 log: both followers skipped without a line).
+            if (a->IsDisabled()) {
+                Out(std::format("{} - disabled at the load - no preset pass", name));
+                continue;
+            }
+            {
+                std::lock_guard lock(g_lock);
+                if (i < static_cast<int>(g_loadWait.size())) {
+                    g_loadWait[i] = 1;
+                }
+            }
+            Out(std::format("{} - 3D not ready at the load - waiting for it", name));
+            WaitForLoad(i, kLoadWaitTries);
         }
         AutoScanSoon();  // NG (user): Nearby Actors list for this save
     }

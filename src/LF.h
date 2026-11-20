@@ -138,6 +138,12 @@ namespace LF
     void LoadForms();          // kDataLoaded
     bool FormsFound();
     void InstallSinks();       // kDataLoaded: crosshair + 3D loaded events
+    // NG 1.3.3: ShowRaceMenu NPC's Reset Lazy Follower set a follower's race back (SKSE message 'SRRR'): the
+    // followers' races become their slots' races, like after RaceMenu closes. Any thread.
+    void RaceResetByShowRaceMenu();
+    // NG 1.3.4: every follower with a preset (actor ref, RaceMenu preset, Erin preset) - ShowRaceMenu NPC's 'SRLQ'
+    // question. Any thread (under the slot lock).
+    void ForEachFollowerPreset(const std::function<void(RE::FormID, const std::string&, const std::string&)>& a_fn);
     void RegisterCosave();     // SKSEPluginLoad
     void OnGameLoaded();       // kPostLoadGame / kNewGame
     void OnNewGame();          // kNewGame: OnGameLoaded + Keep in New Games waits for RaceMenu to close

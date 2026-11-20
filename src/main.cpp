@@ -26,6 +26,35 @@ namespace
         spdlog::set_default_logger(std::move(log));
     }
 
+    // NG 1.3.3: messages from ShowRaceMenu NPC - 'SRRR' {ref, race}: its Reset Lazy Follower set the follower's race
+    // back; the slot takes it (else the next apply would put the race from its last RaceMenu Done back).
+    // NG 1.3.4: 'SRLQ' = ShowRaceMenu NPC asks which actors are Lazy Followers (it read only the keep file before, so a
+    // follower without Keep in New Game looked like a plain NPC to it). Same layout in ShowRaceMenu NPC's RealMenu.cpp.
+    struct LfFollowersQuery
+    {
+        std::uint32_t version = 1;
+        bool          answered = false;
+        void*         ctx = nullptr;
+        void (*add)(void* a_ctx, RE::FormID a_ref, const char* a_preset, const char* a_erinPreset) = nullptr;
+    };
+
+    void OnShowRaceMenuMessage(SKSE::MessagingInterface::Message* a_message)
+    {
+        if (a_message && a_message->type == 'SRRR' && a_message->dataLen >= 2 * sizeof(RE::FormID) && a_message->data) {
+            const auto ids = static_cast<const RE::FormID*>(a_message->data);
+            logger::info("ShowRaceMenu NPC: race of {:08X} reset to {:08X}", ids[0], ids[1]);
+            LF::RaceResetByShowRaceMenu();
+        } else if (a_message && a_message->type == 'SRLQ' && a_message->dataLen >= sizeof(LfFollowersQuery) && a_message->data) {
+            auto query = static_cast<LfFollowersQuery*>(a_message->data);
+            if (query->version >= 1 && query->add) {
+                LF::ForEachFollowerPreset([query](RE::FormID a_ref, const std::string& a_preset, const std::string& a_erin) {
+                    query->add(query->ctx, a_ref, a_preset.c_str(), a_erin.c_str());
+                });
+                query->answered = true;
+            }
+        }
+    }
+
     // kPostLoad = SMF pages + window and the hotkey reader (every plugin is loaded then), kPostPostLoad = the Erin race's
     // interface, kDataLoaded = LazyFollowers.esp's forms + events,
     // kPostLoadGame / kNewGame = in game (refresh the followers; a new game: Keep in New Games), kSaveGame = Keep in
@@ -35,6 +64,8 @@ namespace
         switch (a_message->type) {
         case SKSE::MessagingInterface::kPostLoad:
             LF::LoadEarlySettings();
+            // NG 1.3.3: ShowRaceMenu NPC (optional) - its Reset Lazy Follower sends the race it set back
+            SKSE::GetMessagingInterface()->RegisterListener("ShowRaceMenu NPC", OnShowRaceMenuMessage);
             Menu::Register();
             Hotkey::Start();
             break;

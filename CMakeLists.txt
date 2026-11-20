@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(LazyFollowersNG VERSION 1.3.0 LANGUAGES CXX)  # -> LazyFollowersNG.dll
+project(LazyFollowersNG VERSION 1.3.4 LANGUAGES CXX)  # -> LazyFollowersNG.dll
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,7 +35,7 @@ add_commonlibsse_plugin(
     ${PROJECT_NAME}
     NAME "Lazy Followers NG"
     AUTHOR "Byronic"
-    VERSION 1.3.0
+    VERSION 1.3.4
     USE_ADDRESS_LIBRARY
     SOURCES
         src/main.cpp
