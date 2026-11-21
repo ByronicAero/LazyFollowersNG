@@ -1078,7 +1078,11 @@ namespace Menu
             // NG 1.2 (user): renamed from "Take Over NPC"; also shown on the taken-over NPC (ticked) so it can be undone.
             // NG (user): renamed "... voiced .esp"; on a slot it only shows when the picked voice belongs to a modded
             // follower NPC of the game (Lists::ownedVoices, e.g. Sofia's), so it doesn't confuse with other voices
-            const bool showOverride = s.real ? s.moddedVoice : lists.ownedVoices.contains(e.voice);
+            // NG (user video 2026-11-21 00-04-02: Serana taken over, EvenToned picked -> the box stayed and Apply put
+            // EvenToned on Serana): on a taken-over NPC it also hides once a voice is picked that needs no Override (not
+            // its own, not a modded follower's); Apply then counts it as off -> the NPC is given back automatically
+            const bool showOverride = s.real ? s.moddedVoice && (e.voice == s.defaultVoice || lists.ownedVoices.contains(e.voice))
+                                             : lists.ownedVoices.contains(e.voice);
             // NG (user): the voice's NPC is already another follower's Override -> Apply Settings with the box ticked asks
             // to move it here (Yes: that follower gives the NPC back - it goes to a free slot with the voice - and this
             // follower takes it over with this page's settings). Ticking the box alone does nothing yet (user). Also on a
@@ -1100,6 +1104,8 @@ namespace Menu
                              "Untick, then Apply Settings: it is given back (own look, name and outfit, sent to its own place)\n"
                              "and a free Lazy Followers slot becomes the follower with this preset, race and name and the\n"
                              "NPC's voice (voice only - its mod's lines are swapped in). The follower's gear goes along.\n"
+                             "A voice picked that needs no Override (e.g. EvenToned): this box hides and Apply Settings gives\n"
+                             "the NPC back the same way - the free slot gets the picked voice.\n"
                              "Another modded follower's voice picked (box ticked) + Apply Settings: this NPC is given back and\n"
                              "that voice's own NPC becomes the follower with this preset, race and name (gear and Keep boxes go along)."
                            : "Off: the follower only borrows the voice - its mod's lines are swapped in; the voice's own NPC\n"
@@ -1128,7 +1134,7 @@ namespace Menu
                 if (e.takeOver && holder >= 0) {
                     openMove = true;
                 } else {
-                    LF::ApplyRequest req{ e.name.data(), e.race, e.voice, e.presetFile, s.real ? e.takeOver : e.takeOver && showOverride };  // a slot's hidden box counts as off
+                    LF::ApplyRequest req{ e.name.data(), e.race, e.voice, e.presetFile, e.takeOver && (showOverride || (s.real && !s.moddedVoice)) };  // a hidden box counts as off (a real NPC without a modded voice keeps its entry)
                     req.erinPreset = erinRace ? e.erinPreset : std::string{};  // another race: no Erin preset (the old one is taken off)
                     LF::Apply(g_selected, std::move(req));
                 }

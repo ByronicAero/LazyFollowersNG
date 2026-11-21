@@ -3,7 +3,7 @@
 An SKSE plugin that replaces [Lazy Followers](https://www.nexusmods.com/skyrimspecialedition/mods/43312) 0.42.3 by [LazyGirl](https://www.nexusmods.com/profile/LazyGirl?gameId=1704): its Papyrus scripts and MCM are now C++ and **SKSE Menu Framework** pages.
 It uses its own modified copy of `LazyFollowers.esp` and the same files and folders as the original mod, so presets, NPC files and the config carry over.
 
-Version 1.4.0. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
+Version 1.4.1. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
 
 ## Requirements
 
@@ -55,7 +55,7 @@ Stats, Combat Styles and Settings have a search box at the top.
 **Modded follower voices**
 
 - A follower given the voice type of a voiced-follower mod (for example Sofia or Severa) says that mod's own lines: greetings, Follow / Wait / Trade / Part ways answers and its "Can I talk to you?" topics. Lines the mod has no recording for are silenced.
-- Override: with that voice picked, the mod's real NPC can take the follower's place. She gets the follower's preset, race and name, and keeps her own voice, quests and dialogue. Stats, spells, combat style and class can be set on her like on a slot follower. Remove gives back her own look, name, outfit, style and class and sends her back to her own place. Override can move from one follower to another.
+- Override: with that voice picked, the mod's real NPC can take the follower's place. She gets the follower's preset, race and name, and keeps her own voice, quests and dialogue. Stats, spells, combat style and class can be set on her like on a slot follower. Remove gives back her own look, name, outfit, style and class and sends her back to her own place. Override can move from one follower to another. Picking a voice that is not hers (e.g. EvenToned) hides the Override box; Apply Settings then gives her back and a normal follower slot takes the preset with that voice.
 - Override also works with a base-game voice that belongs to one single NPC, such as Serana's (`DLC1SeranaVoice`): the real Serana becomes the follower with all her own dialogue. She is part of the Dawnguard questline, so taking her over while a quest still needs her can clash with it.
 - When a follower gets two talk options with the same text from different mods (e.g. "Follow me. I need your help." from the game and from Relationship Dialogue Overhaul), the one from the mod gets the mod's short name: "Follow me. I need your help. (RDO)".
 

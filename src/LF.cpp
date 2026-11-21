@@ -1706,7 +1706,7 @@ namespace LF
             chain->Run();
         }
 
-        // The scripts' summonMe: enable if needed, then move to a_target - here 120 units in front of it
+        // The scripts' summonMe: enable if needed (a loaded one is disabled for the move), then move to a_target - here 120 units in front of it
         // (the script used no offset = on top of the player). The log line says where it ended up.
         // a_then (main thread, after the move) replaces the usual lite apply (Apply Settings: the full apply).
         void SummonTo(RE::Actor* a_actor, RE::TESObjectREFR* a_target, std::function<void()> a_then = {})
@@ -1722,9 +1722,20 @@ namespace LF
             if (a_actor->IsDisabled()) {
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Enable", d, false); });
             }
+            // NG fix (user picture 2026-11-21: the follower's belly sometimes stuck out after a summon; Disable + Enable
+            // fixed it): a MoveTo of an actor whose 3D is loaded drags its body physics (CBPC / SMP bones) along the
+            // jump. Such an actor is disabled for the move and enabled at its new place - fresh 3D, fresh physics.
+            // Not loaded (e.g. fresh from storage): moved as before.
+            const bool blink = !a_actor->IsDisabled() && a_actor->Is3DLoaded();
+            if (blink) {
+                chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Disable", d, false); });
+            }
             chain->Then([a_actor, a_target, dx, dy](Papyrus::Done d) {
                 return Papyrus::CallMethod(a_actor, "ObjectReference", "MoveTo", d, a_target, dx, dy, 0.0f, true);
             });
+            if (blink) {
+                chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Enable", d, false); });
+            }
             chain->ThenDo([a_actor, a_target, a_then]() {
                 OnMain([a_actor, a_target, a_then]() {
                     Out(std::format("Summoned {}: {:.0f} units from {}, disabled {}", DisplayName(a_actor),
@@ -4243,8 +4254,15 @@ namespace LF
             // swapped in). The follower's gear goes along (the take-over's TransferGear the other way).
             if (IsReal(a_slot) && !req.takeOver) {
                 auto owner = ActorOf(a_slot);
-                auto npc = owner ? owner->GetActorBase() : nullptr;
-                if (npc && Voice::IsFollowerVoice(npc->voiceType)) {
+                // NG fix (user: Serana taken over, voice switched to EvenToned, box unticked -> bugged): the NPC's OWN
+                // voice decides (like the page's box, Snapshot moddedVoice) - its current one may already be the newly
+                // picked voice from an earlier Apply, which skipped the give-back and left Serana with EvenToned
+                RE::FormID ownVoice = 0;
+                {
+                    std::lock_guard lock(g_lock);
+                    ownVoice = g_slots[a_slot].defaultVoice;
+                }
+                if (owner && Voice::IsFollowerVoice(Lookup<RE::BGSVoiceType>(ownVoice))) {
                     int freeSlot = -1;
                     {
                         std::lock_guard lock(g_lock);
