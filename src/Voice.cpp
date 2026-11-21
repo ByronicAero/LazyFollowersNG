@@ -378,6 +378,15 @@ namespace Voice
                 }
                 lines = &it->second;  // never changed or erased after Prepare
             }
+            // NG (review: voice FE063838 has 0 lines of its mod - every topic still ran the candidate search and logged
+            // "no line of its voice mod"): nothing to pick from - same result as before (a_none set), without the
+            // search and the per-topic line (Prepare logged "0 lines of its mod found" once for it)
+            if (lines->empty()) {
+                if (a_none) {
+                    *a_none = true;
+                }
+                return nullptr;
+            }
             for (auto& l : *lines) {
                 if (l.info == a_info) {
                     return nullptr;  // already a line of that voice
@@ -494,6 +503,85 @@ namespace Voice
         std::unordered_map<const RE::MenuTopicManager::Dialogue*, RE::TESTopicInfo*> g_checked;     // main thread: entry -> info checked
         std::recursive_mutex                                                          g_menuLock;    // g_redirected (MenuDataHook may run off the main thread)
 
+        // NG (user: two identical "Follow me. I need your help." on a slot follower - "how would the user know which
+        // one to choose?" -> label each one): a plugin's short name for a talk menu tag - its name without the
+        // extension; a name of several words -> their initials ("Relationship Dialogue Overhaul.esp" -> "RDO").
+        std::string PluginTag(const RE::TESFile* a_file)
+        {
+            std::string name(a_file->GetFilename());
+            if (auto dot = name.find_last_of('.'); dot != std::string::npos) {
+                name.resize(dot);
+            }
+            if (name.find(' ') == std::string::npos) {
+                return name;
+            }
+            std::string initials;
+            bool        start = true;
+            for (char c : name) {
+                if (c == ' ') {
+                    start = true;
+                } else if (start) {
+                    initials += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    start = false;
+                }
+            }
+            return initials;
+        }
+
+        // Talk menu entries of a Lazy Followers slot follower (the speaker) with the same text from topics of different
+        // plugins: each one from a mod gets " (<tag>)" like NFF's "(NFF)"; a base-game topic keeps its plain text.
+        // Runs when an entry is built (a_new may not be in the list yet) and in PatchMenu; a tag is added only once.
+        void LabelDuplicates(RE::MenuTopicManager::Dialogue* a_new)
+        {
+            auto mtm = RE::MenuTopicManager::GetSingleton();
+            auto ref = mtm ? mtm->speaker.get() : RE::NiPointer<RE::TESObjectREFR>{};
+            auto actor = ref ? ref->As<RE::Actor>() : nullptr;
+            auto npc = actor ? actor->GetActorBase() : nullptr;
+            auto npcFile = npc ? npc->GetFile(0) : nullptr;
+            if (!npcFile || !EqualsI(npcFile->GetFilename(), "LazyFollowers.esp")) {
+                return;
+            }
+            struct Entry
+            {
+                RE::MenuTopicManager::Dialogue* d;
+                const RE::TESFile*              file;
+                std::string                     tag;    // "" = base game (no tag)
+                std::string                     plain;  // its text without our tag
+            };
+            std::vector<Entry> entries;
+            auto add = [&](RE::MenuTopicManager::Dialogue* a_d) {
+                if (!a_d || !a_d->parentTopic || std::any_of(entries.begin(), entries.end(), [&](const Entry& e) { return e.d == a_d; })) {
+                    return;
+                }
+                const char* t = a_d->topicText.c_str();
+                auto        file = a_d->parentTopic->GetFile(0);
+                if (!t || !*t || !file) {
+                    return;
+                }
+                Entry e{ a_d, file, BaseGameFile(file) ? std::string{} : PluginTag(file), t };
+                if (const auto suffix = " (" + e.tag + ")"; !e.tag.empty() && e.plain.size() > suffix.size() && e.plain.ends_with(suffix)) {
+                    e.plain.resize(e.plain.size() - suffix.size());
+                }
+                entries.push_back(std::move(e));
+            };
+            if (mtm->dialogueList) {
+                for (auto d : *mtm->dialogueList) {
+                    add(d);
+                }
+            }
+            add(a_new);
+            for (auto& e : entries) {
+                if (e.tag.empty()) {
+                    continue;
+                }
+                const bool twin = std::any_of(entries.begin(), entries.end(), [&](const Entry& o) { return o.d != e.d && o.file != e.file && o.plain == e.plain; });
+                const std::string labeled = e.plain + " (" + e.tag + ")";
+                if (twin && labeled != e.d->topicText.c_str()) {
+                    e.d->topicText = labeled.c_str();
+                }
+            }
+        }
+
         // Puts every redirected answer back (talk menu closed).
         void RestoreMenu()
         {
@@ -525,6 +613,7 @@ namespace Voice
                     for (auto d : *mtm->dialogueList) {
                         RenameMenuEntry(d);  // NG 1.2: nickname of a real NPC follower
                     }
+                    LabelDuplicates(nullptr);  // NG: same text from two plugins -> "(RDO)"
                 }
                 if (speaker && mtm->dialogueList) {
                     for (auto d : *mtm->dialogueList) {
@@ -608,6 +697,7 @@ namespace Voice
             auto result = reinterpret_cast<void* (*)(void*, void*, void*, void*, void*, std::uint8_t)>(g_entryCtor)(a_entry, a_2, a_3, a_4, a_5, a_6);
             try {
                 RenameMenuEntry(static_cast<RE::MenuTopicManager::Dialogue*>(a_entry));
+                LabelDuplicates(static_cast<RE::MenuTopicManager::Dialogue*>(a_entry));  // NG: "(RDO)" on a doubled option
             } catch (...) {
             }
             return result;
@@ -1296,6 +1386,42 @@ namespace Voice
     }
 
     bool IsModded(const RE::BGSVoiceType* a_voice) { return a_voice && !BaseGameFile(a_voice->GetFile(0)); }
+
+    // NG (user: Serana's voice should bring her own dialogue - "Override the real Serana"): a voice the Override box /
+    // take-over works with: a modded voice, or a base-game voice that exactly one NPC of the game has and that NPC is
+    // unique (DLC1SeranaVoice -> DLC1Serana only). Shared voices (FemaleYoungEager...) have no single NPC. Lazy
+    // Followers' own NPCs are not counted. Counted once (first call, in game). No line swap for base-game voices.
+    // NG fix (review): that NPC must be a person (race keyword ActorTypeNPC) - Paarthurnax / creatures with a voice of
+    // their own must not get the Override box (a RaceMenu preset on a dragon).
+    bool IsFollowerVoice(const RE::BGSVoiceType* a_voice)
+    {
+        if (!a_voice) {
+            return false;
+        }
+        if (IsModded(a_voice)) {
+            return true;
+        }
+        static std::once_flag                         once;
+        static std::unordered_map<RE::FormID, int>    uses;  // voice -> unique NPCs with it; -1 = a non-unique NPC has it too
+        std::call_once(once, []() {
+            auto dh = RE::TESDataHandler::GetSingleton();
+            if (!dh) {
+                return;
+            }
+            for (auto npc : dh->GetFormArray<RE::TESNPC>()) {
+                auto v = npc ? npc->voiceType : nullptr;
+                auto file = npc ? npc->GetFile(0) : nullptr;
+                if (!v || (file && EqualsI(file->GetFilename(), "LazyFollowers.esp"))) {
+                    continue;
+                }
+                const bool person = npc->race && npc->race->HasKeywordString("ActorTypeNPC");
+                auto&      n = uses[v->GetFormID()];
+                n = (!npc->IsUnique() || !person || n < 0) ? -1 : n + 1;
+            }
+        });
+        const auto it = uses.find(a_voice->GetFormID());
+        return it != uses.end() && it->second == 1;
+    }
 
     namespace
     {

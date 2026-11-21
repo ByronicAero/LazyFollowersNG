@@ -3,7 +3,7 @@
 An SKSE plugin that replaces [Lazy Followers](https://www.nexusmods.com/skyrimspecialedition/mods/43312) 0.42.3 by [LazyGirl](https://www.nexusmods.com/profile/LazyGirl?gameId=1704): its Papyrus scripts and MCM are now C++ and **SKSE Menu Framework** pages.
 It uses its own modified copy of `LazyFollowers.esp` and the same files and folders as the original mod, so presets, NPC files and the config carry over.
 
-Version 1.3.4. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and two parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu) and clearing a taken-over NPC's race-change face on Remove.
+Version 1.4.0. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
 
 ## Requirements
 
@@ -31,7 +31,7 @@ No longer needed: SkyUI / MCM, JContainers, PapyrusUtil, powerofthree's Papyrus 
 - **Followers**
   - The Follower list shows only followers in use: name and base form ID, searchable. Add Follower takes the next free slot.
   - Distance and location of the selected follower.
-  - Appearance: name, preset, race and Female / Male / Other Voice, all searchable drop-downs. Picking a preset switches Race to the race it was made for. Apply Settings applies the preset, then brings the follower to you (not when it is already next to you).
+  - Appearance: name, preset, race and Female / Male / Other Voice, all searchable drop-downs. Races from mods show their plugin, e.g. "Nord UBE [UBE_AllRace.esp]". Picking a preset switches Race to the race it was made for. Apply Settings applies the preset, then brings the follower to you (not when it is already next to you).
   - Erin Preset (with the Erin race installed, only for Erin-race followers): loads an Erin race extra preset (extra tints, eye colour set, skin, head-part adjust) on the follower.
   - Keep in New Game (with Pre Summon): the follower comes back in a new game once RaceMenu closes.
   - NPC Preset, Actions (Summon, Teleport, Remove, Copy Kit with Auto Equip and Include Equipment), Apply to All / Summon All, Combat Style and Class.
@@ -46,10 +46,18 @@ No longer needed: SkyUI / MCM, JContainers, PapyrusUtil, powerofthree's Papyrus 
 
 Stats, Combat Styles and Settings have a search box at the top.
 
+**Inventory: every item**
+
+- Open Inventory (hotkey) on an NPC lists everything it carries, also items the game hides: non-playable items (skins, body / physics add-ons, mod items) and its outfit pieces. Your side of that trade window lists everything too. Chests, looting, pickpocketing and trading through dialogue stay as in the game.
+- Your own inventory (Tab / I, or Open Inventory on yourself) always lists every item, non-playable ones included.
+- Taking a follower's outfit pieces makes the game put her outfit back on her.
+
 **Modded follower voices**
 
 - A follower given the voice type of a voiced-follower mod (for example Sofia or Severa) says that mod's own lines: greetings, Follow / Wait / Trade / Part ways answers and its "Can I talk to you?" topics. Lines the mod has no recording for are silenced.
 - Override: with that voice picked, the mod's real NPC can take the follower's place. She gets the follower's preset, race and name, and keeps her own voice, quests and dialogue. Stats, spells, combat style and class can be set on her like on a slot follower. Remove gives back her own look, name, outfit, style and class and sends her back to her own place. Override can move from one follower to another.
+- Override also works with a base-game voice that belongs to one single NPC, such as Serana's (`DLC1SeranaVoice`): the real Serana becomes the follower with all her own dialogue. She is part of the Dawnguard questline, so taking her over while a quest still needs her can clash with it.
+- When a follower gets two talk options with the same text from different mods (e.g. "Follow me. I need your help." from the game and from Relationship Dialogue Overhaul), the one from the mod gets the mod's short name: "Follow me. I need your help. (RDO)".
 
 **Changes from the original mod**
 
@@ -105,7 +113,7 @@ CommonLibSSE-NG, spdlog, nlohmann-json, rapidcsv and zlib are downloaded on the 
 
 | Folder | What |
 |---|---|
-| `src` | `main.cpp` (SKSE messages), `LF.cpp` (follower slots, co-save, actions, take-over, Erin preset, Open Inventory), `Files.cpp` (JSON files, presets), `Papyrus.cpp` (safe Papyrus calls), `Tint.cpp` (face tint to .dds), `Menu.cpp` (the pages and the windows), `Hotkey.cpp` (hotkeys), `Voice.cpp` (modded follower voices) |
+| `src` | `main.cpp` (SKSE messages), `LF.cpp` (follower slots, co-save, actions, take-over, Erin preset, Open Inventory and the every-item inventory lists), `Files.cpp` (JSON files, presets), `Papyrus.cpp` (safe Papyrus calls), `Tint.cpp` (face tint to .dds), `Menu.cpp` (the pages and the windows), `Hotkey.cpp` (hotkeys), `Voice.cpp` (modded follower voices) |
 | `include` | precompiled header, SKSE Menu Framework header |
 | `data` | the modified `LazyFollowers.esp` (packed into the zip) |
 

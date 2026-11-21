@@ -262,6 +262,7 @@ namespace LF
     void ResetPovHold();                           // NG: a window closed - the game's "Toggle POV held" (fovSlideMode) off (its key release went to the window)
     void OpenInventory(RE::FormID a_ticked, int a_tries = 0);  // NG (user): Open Inventory hotkey - the ticked actor (an open one is closed first)
     RE::FormID InventoryOpenFor();                 // the actor whose inventory Open Inventory has open now (0 = none)
+    void InstallInventoryHook();                   // kDataLoaded: Open Inventory shows every item (ContainerMenu filter hook, 1.6.1170)
     void TeleportTo(int a_slot);
     void Dismiss(int a_slot);                      // reset + back to storage
     void CopyKit(int a_slot);                      // player's worn gear -> follower

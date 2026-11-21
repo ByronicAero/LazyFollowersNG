@@ -77,6 +77,7 @@ namespace
             if (LF::FormsFound()) {
                 LF::InstallSinks();
                 Voice::Install();  // modded voices: follower lines in that voice
+                LF::InstallInventoryHook();  // NG (user): Open Inventory shows every item
                 Voice::StartOwnerScan();  // modded follower voices from the plugin files (Override box)
             }
             break;

@@ -585,6 +585,9 @@ namespace LF
         // voice is added to every form list that holds FemaleEvenToned (13ADD) / MaleEvenToned (13AD2), so the
         // follower gets EvenToned's dialogue (lines without audio of that voice show subtitles only). Form-list
         // additions are not saved by us: done again after every load (g_dialogueVoices is cleared then).
+        // Every voice not in VoicesFollowerAll, base-game ones too (FemaleChild...). (114) limited this to modded voices
+        // (it gave a doubled "Follow me. I need your help." with RDO's own FemaleChild line), but that took dialogue
+        // away - reverted (user, 2026-11-20): the doubled recruit line is accepted.
         std::unordered_set<RE::FormID> g_dialogueVoices;  // main thread: voices already handled this load
 
         void GiveFollowerDialogue(RE::BGSVoiceType* a_voice, bool a_female)
@@ -825,13 +828,17 @@ namespace LF
             // still had its own race (Sofia = not Erin), so the Erin skin never went on her body. [5] = re-verify
             // (RemoveErinActorMap drops that answer, Erin checks the actor again with the race it has now); the
             // preset after it registers the tints / skin again.
-            reinterpret_cast<void (*)(void*, RE::Actor*)>(vtbl[5])(g_erin, actor);
-            const bool ok = reinterpret_cast<bool (*)(void*, RE::Actor*, const char*)>(vtbl[3])(g_erin, actor, path.c_str());
-            if (ok) {
-                Out(std::format("{} - Erin preset {} loaded", name, file));
-            } else {
-                logger::warn("{} - Erin preset {} could not be loaded (see ErinRace.log)", name, file);
+            // NG fix (review 2026-11-20: "could not be loaded" warning while ErinRace.log said "Extra preset ... Loaded"):
+            // [3]'s bool is always false in MuErinRace 1.4.28 (its loader 0x2790c0 has one return, "xor al, al", right
+            // after that log line), so it says nothing. The file's presence is checked here instead; Erin's own result
+            // is in ErinRace.log.
+            if (!std::filesystem::exists(std::filesystem::path("Data\\SKSE\\Plugins") / path)) {
+                logger::warn("{} - Erin preset {} not found (Data\\SKSE\\Plugins\\{}) - not loaded", name, file, path);
+                return;
             }
+            reinterpret_cast<void (*)(void*, RE::Actor*)>(vtbl[5])(g_erin, actor);
+            reinterpret_cast<void (*)(void*, RE::Actor*, const char*)>(vtbl[3])(g_erin, actor, path.c_str());
+            Out(std::format("{} - Erin preset {} sent to the Erin race (its result: ErinRace.log \"Extra preset ... Loaded\")", name, file));
         }
 
         // NG (ShowRaceMenu NPC, 2026-11-19): RaceMenu (the game's RaceSex Menu) is open - it may be editing a follower
@@ -1793,13 +1800,30 @@ namespace LF
             return ed && *ed ? ed : std::format("VoiceType {:08X}", a_v->GetFormID());
         }
 
-        // A race's display name: its name, plus the plugin when two races share a name.
-        std::string RaceLabel(const RE::TESRace* a_r)
+        // A race's plain name (full name, else editor ID, else form ID).
+        std::string RaceName(const RE::TESRace* a_r)
         {
             std::string name = a_r->GetFullName();
             if (name.empty()) {
                 const char* ed = a_r->GetFormEditorID();
                 name = ed && *ed ? ed : std::format("Race {:08X}", a_r->GetFormID());
+            }
+            return name;
+        }
+
+        // True for Skyrim.esm, Update.esm and the three DLC (their races get no plugin tag).
+        bool BaseGameRaceFile(const RE::TESFile* a_file)
+        {
+            static constexpr std::string_view kBase[] = { "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm" };
+            return !a_file || std::any_of(std::begin(kBase), std::end(kBase), [&](std::string_view b) { return _stricmp(a_file->fileName, b.data()) == 0; });
+        }
+
+        // A race's display name: its name, plus " [plugin]" for a race from a mod (NG (user): custom races show their file).
+        std::string RaceLabel(const RE::TESRace* a_r)
+        {
+            auto name = RaceName(a_r);
+            if (auto file = a_r->GetFile(0); !BaseGameRaceFile(file)) {
+                name = std::format("{} [{}]", name, file->GetFilename());
             }
             return name;
         }
@@ -1848,15 +1872,15 @@ namespace LF
             for (auto r : races) {
                 if (seen.insert(r).second) {
                     unique.push_back(r);
-                    ++nameCount[RaceLabel(r)];
+                    ++nameCount[RaceName(r)];
                 }
             }
             for (auto r : unique) {
                 auto label = RaceLabel(r);
-                if (nameCount[label] > 1) {
+                if (const auto name = RaceName(r); nameCount[name] > 1) {
                     const bool vampire = r->HasKeywordString("Vampire");
                     auto       file = r->GetFile(0);
-                    label = std::format("{}{} [{}]", label, vampire ? " (Vampire)" : "", file ? file->GetFilename() : "?"sv);
+                    label = std::format("{}{} [{}]", name, vampire ? " (Vampire)" : "", file ? file->GetFilename() : "?"sv);
                 }
                 l->races.push_back({ r->GetFormID(), std::move(label) });
             }
@@ -1934,11 +1958,12 @@ namespace LF
                 }
                 std::sort(l->otherVoices.begin(), l->otherVoices.end(), [](const Choice& a, const Choice& b) { return a.name < b.name; });
                 // NG (user): the Override box only for a modded follower's voice - a modded voice (not a base-game
-                // file) that a unique NPC of another plugin uses (what FindVoiceOwner looks for on Apply)
+                // file) that a unique NPC of another plugin uses (what FindVoiceOwner looks for on Apply). NG (user):
+                // also a base-game voice of one unique NPC (Serana's, Voice::IsFollowerVoice)
                 for (auto npc : dh->GetFormArray<RE::TESNPC>()) {
                     auto v = npc ? npc->voiceType : nullptr;
                     auto file = npc ? npc->GetFile(0) : nullptr;
-                    if (v && npc->IsUnique() && !(file && file->GetFilename() == kPlugin) && !l->ownedVoices.contains(v->GetFormID()) && Voice::IsModded(v)) {
+                    if (v && npc->IsUnique() && !(file && file->GetFilename() == kPlugin) && !l->ownedVoices.contains(v->GetFormID()) && Voice::IsFollowerVoice(v)) {
                         l->ownedVoices.insert(v->GetFormID());
                     }
                 }
@@ -2152,7 +2177,7 @@ namespace LF
             }
             for (int i = 0; i < static_cast<int>(s.slots.size()); ++i) {
                 if (s.slots[i].real && s.slots[i].ref) {
-                    s.slots[i].moddedVoice = Voice::IsModded(Lookup<RE::BGSVoiceType>(s.slots[i].defaultVoice));
+                    s.slots[i].moddedVoice = Voice::IsFollowerVoice(Lookup<RE::BGSVoiceType>(s.slots[i].defaultVoice));
                 }
             }
             s.live.resize(g_actors.size());
@@ -3113,13 +3138,29 @@ namespace LF
             }
         }
 
+        std::atomic<bool> g_invShowAll{ false };  // NG: the open ContainerMenu was opened by Open Inventory (every item shown)
+
+        // NG fix (review 2026-11-20): Open Inventory's menu did not open (2 s after the request) -> its "every item" ends,
+        // so a later dialogue trade / inventory opened another way shows the game's normal list.
+        void ClearShowAllIfNotOpen()
+        {
+            auto ui = RE::UI::GetSingleton();
+            if (g_invShowAll.load() && !(ui && ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME))) {
+                g_invShowAll = false;
+                logger::info("Open Inventory: the NPC's inventory did not open - every-item list switched off again");
+            }
+        }
+
         // RaceMenu (the game's RaceSex Menu) closed: race changes made in it become the slots' races, and a new game
-        // that waits for its kept followers gets them.
+        // that waits for its kept followers gets them. NG: a ContainerMenu closed ends Open Inventory's "show every item".
         class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
         {
         public:
             RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
             {
+                if (a_event && !a_event->opening && a_event->menuName == RE::ContainerMenu::MENU_NAME) {
+                    g_invShowAll = false;
+                }
                 if (!a_event || a_event->opening || a_event->menuName != RE::RaceSexMenu::MENU_NAME) {
                     return RE::BSEventNotifyControl::kContinue;
                 }
@@ -3985,9 +4026,10 @@ namespace LF
         // JJSofiaVoiceType). Matched by its voice in the game or in its plugin file (Voice::PluginNPCs - Severa's
         // differs); unique and alive ones first. References made by scripts (FF......) and our slots are skipped.
         // nullptr = none (a voice pack without its own NPC: the voice is used on the slot as before).
+        // NG (user): also a base-game voice of one unique NPC (Serana's DLC1SeranaVoice -> Serana).
         RE::Actor* FindVoiceOwner(RE::BGSVoiceType* a_voice)
         {
-            if (!a_voice || !Voice::IsModded(a_voice)) {
+            if (!a_voice || !Voice::IsFollowerVoice(a_voice)) {
                 return nullptr;
             }
             const auto                           npcs = Voice::PluginNPCs(a_voice);
@@ -4202,7 +4244,7 @@ namespace LF
             if (IsReal(a_slot) && !req.takeOver) {
                 auto owner = ActorOf(a_slot);
                 auto npc = owner ? owner->GetActorBase() : nullptr;
-                if (npc && Voice::IsModded(npc->voiceType)) {
+                if (npc && Voice::IsFollowerVoice(npc->voiceType)) {
                     int freeSlot = -1;
                     {
                         std::lock_guard lock(g_lock);
@@ -4486,8 +4528,118 @@ namespace LF
             }
             Out(std::format("Opening {}'s inventory", DisplayName(actor)));
             g_invActor = actor->GetFormID();
+            g_invShowAll = true;  // NG (user): every item, also non-playable and outfit items (ContainerFilterHook)
             Papyrus::CallMethod(actor, "Actor", "OpenInventory", nullptr, true);
+            After(2.0f, []() { ClearShowAllIfNotOpen(); });
         });
+    }
+
+    // NG (user: "the Inventory doesn't show everything" - chose to patch the game's menu, outfit items too). The game's
+    // ContainerMenu lists only entries its item filter (ID 51171) accepts: that filter hides non-playable / nameless
+    // items (item test ID 51818) and, in NPC mode, subtracts the NPC's outfit items. RE (1.6.1170 dump, capstone):
+    // Docs/game-inventory-menu-re.md. Our hook on the filter's two calls (51156+0xA6 full build, 51157+0xA8 refresh):
+    // for the NPC's side of a ContainerMenu opened by Open Inventory, the filter runs with mode 0 (no outfit / steal
+    // part) and an entry the item test rejected is shown anyway. Other containers, trades, looting stay vanilla.
+    namespace
+    {
+        // The context ContainerMenu 51144 / 51146 builds for the filter (read from the disassembly).
+        struct ContainerFilter
+        {
+            RE::TESObjectREFR* target;         // 00 the container / NPC
+            std::uint32_t      mode;           // 08 ContainerMode: 2 = steal, 3 = NPC mode (the outfit part)
+            std::int32_t       unk0C;          // 0C
+            bool               containerSide;  // 10 true = the target's list, false = the player's
+            bool               ownedOnly;      // 11
+        };
+        static_assert(offsetof(ContainerFilter, containerSide) == 0x10);
+
+        using FilterFn = bool (*)(ContainerFilter*, RE::InventoryEntryData*);
+        using ItemTestFn = bool (*)(RE::InventoryEntryData*);
+        FilterFn   g_filter = nullptr;    // the game's filter (51171)
+        ItemTestFn g_itemTest = nullptr;  // the game's item test (51818): false = hidden (non-playable, no name ...)
+
+        // An entry the item test rejected that is still a real item (its form exists, not gold - the menus show gold apart).
+        bool ShowAnyway(RE::InventoryEntryData* a_entry)
+        {
+            auto obj = a_entry ? a_entry->object : nullptr;
+            return obj && obj->GetFormID() != 0xF && RE::TESForm::LookupByID(obj->GetFormID()) && !g_itemTest(a_entry);
+        }
+
+        // The filter call, hooked: both lists of a ContainerMenu opened by Open Inventory show every item - the NPC's
+        // (outfit part skipped) and, NG (user: "onto the player too"), yours.
+        bool ContainerFilterHook(ContainerFilter* a_ctx, RE::InventoryEntryData* a_entry)
+        {
+            if (!a_ctx || !a_ctx->target || !g_invShowAll.load() || a_ctx->target->GetFormID() != g_invActor.load()) {
+                return g_filter(a_ctx, a_entry);
+            }
+            ContainerFilter ctx = *a_ctx;
+            ctx.mode = 0;  // the filter only reads it: not 3 = no outfit subtraction, not 2 = no steal checks
+            if (g_filter(&ctx, a_entry)) {
+                return true;
+            }
+            return ShowAnyway(a_entry);  // hidden by the item test only -> shown
+        }
+
+        // NG (user: "onto the player too"; then screenshot: also the normal Skyrim inventory, Tab / I): the item test call
+        // in your InventoryMenu's list builders (51866 build, 51868 refresh, 51867 / 51873 / 51874 single-item adds):
+        // every item is shown, however the inventory was opened.
+        bool InventoryItemTestHook(RE::InventoryEntryData* a_entry)
+        {
+            return g_itemTest(a_entry) || ShowAnyway(a_entry);
+        }
+
+        // True when a_at holds "call a_target" (rel32) - nobody else patched it.
+        bool IsCallTo(std::uintptr_t a_at, std::uintptr_t a_target)
+        {
+            const auto* b = reinterpret_cast<const std::uint8_t*>(a_at);
+            if (b[0] != 0xE8) {
+                return false;
+            }
+            std::int32_t rel;
+            std::memcpy(&rel, b + 1, sizeof(rel));
+            return a_at + 5 + static_cast<std::intptr_t>(rel) == a_target;
+        }
+    }
+
+    void InstallInventoryHook()
+    {
+        const auto runtime = REL::Module::get().version();
+        if (runtime != REL::Version(1, 6, 1170, 0)) {
+            logger::info("Open Inventory: game {} is not 1.6.1170 - the inventory shows the game's normal list", runtime.string("."sv));
+            return;
+        }
+        const auto           filter = REL::ID(51171).address();
+        const std::uintptr_t sites[] = { REL::ID(51156).address() + 0xA6, REL::ID(51157).address() + 0xA8 };
+        for (auto at : sites) {
+            if (!IsCallTo(at, filter)) {
+                logger::warn("Open Inventory: the ContainerMenu item filter call at {:X} is not the expected one (another mod?) - not hooked, the inventory shows the game's normal list",
+                    at - REL::Module::get().base());
+                return;
+            }
+        }
+        g_itemTest = reinterpret_cast<ItemTestFn>(REL::ID(51818).address());
+        SKSE::AllocTrampoline(std::size(sites) * 14);
+        for (auto at : sites) {
+            g_filter = reinterpret_cast<FilterFn>(SKSE::GetTrampoline().write_call<5>(at, ContainerFilterHook));
+        }
+        logger::info("Open Inventory: hooked the ContainerMenu item filter (2 calls) - every item of the NPC and yours is shown");
+
+        // NG (user): your own InventoryMenu - its 5 calls of the item test (RE: 51866+0xD6 list build, 51867+0xB3,
+        // 51868+0x125 refresh, 51873+0xA3, 51874+0xA5); all must still be plain calls of it, else none is hooked
+        const std::uintptr_t invSites[] = { REL::ID(51866).address() + 0xD6, REL::ID(51867).address() + 0xB3, REL::ID(51868).address() + 0x125,
+            REL::ID(51873).address() + 0xA3, REL::ID(51874).address() + 0xA5 };
+        for (auto at : invSites) {
+            if (!IsCallTo(at, reinterpret_cast<std::uintptr_t>(g_itemTest))) {
+                logger::warn("Open Inventory: the InventoryMenu item test call at {:X} is not the expected one (another mod?) - your own inventory shows the game's normal list",
+                    at - REL::Module::get().base());
+                return;
+            }
+        }
+        SKSE::AllocTrampoline(std::size(invSites) * 14);
+        for (auto at : invSites) {
+            SKSE::GetTrampoline().write_call<5>(at, InventoryItemTestHook);
+        }
+        logger::info("Open Inventory: hooked the InventoryMenu item test (5 calls) - your own inventory shows every item");
     }
 
     // NG (user): the Summon hotkey. The follower selected in the pages (like the pages: an unlisted
