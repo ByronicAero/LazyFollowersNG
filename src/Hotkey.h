@@ -1,7 +1,7 @@
 #pragma once
 
 // Hotkey - the Settings page's hotkeys (open / close the Lazy Followers window, summon the selected
-// follower, summon all followers, save the player's preset, open the ticked actor's inventory,
+// follower, summon all followers, send a follower to storage (settings kept), save the player's preset, open the ticked actor's inventory,
 // open / close the Nearby Actors window), read from Windows on its own thread like Actor Control's hotkeys.
 
 #include "LF.h"
@@ -13,6 +13,7 @@ namespace Hotkey
         kOpenWindow,
         kSummon,
         kSummonAll,
+        kStore,          // NG (user): sends a follower to storage, its settings kept
         kSavePreset,
         kOpenInventory,  // NG (user): the inventory of the actor ticked in Settings > Nearby Actors
         kNearbyWindow    // NG (user): opens / closes the Nearby Actors window

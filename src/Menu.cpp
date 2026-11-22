@@ -43,6 +43,8 @@ namespace Menu
         constexpr ImVec4 kSectionBlue{ 0.40f, 0.70f, 1.00f, 1.0f };
         constexpr ImVec4 kValueBlue{ 0.55f, 0.85f, 1.00f, 1.0f };
         constexpr ImVec4 kErrorRed{ 1.00f, 0.45f, 0.45f, 1.0f };
+        constexpr ImVec4 kAppliedGreen{ 0.45f, 0.90f, 0.45f, 1.0f };  // NG (user): "Applied" next to Apply Settings
+        constexpr ImVec4 kWarnOrange{ 1.00f, 0.75f, 0.35f, 1.0f };    // NG (user): own-follower-system line
         constexpr float  kMaxControlWidth = 360.0f;
         constexpr float  kMinControlWidth = 120.0f;
         constexpr float  kResetWidth = 60.0f;
@@ -317,8 +319,9 @@ namespace Menu
         // picked index, or -1.
         std::unordered_map<std::string, std::array<char, 64>> g_comboSearch;
 
+        // a_applied (NG, user): the entry the follower has now - a green "Applied" at the right of its row (-1 = none).
         template <class NameOf>
-        int SearchCombo(const char* a_id, const char* a_preview, int a_count, int a_current, NameOf a_name)
+        int SearchCombo(const char* a_id, const char* a_preview, int a_count, int a_current, NameOf a_name, int a_applied = -1)
         {
             int picked = -1;
             if (!BeginSolidCombo(a_id, a_preview, g_rowWidth, ImGuiComboFlags_HeightLargest)) {
@@ -334,7 +337,8 @@ namespace Menu
             InputTextWithHint("##search", "Search...", search.data(), search.size());
             std::vector<int> shown;
             for (int i = 0; i < a_count; ++i) {
-                if (Contains(a_name(i), search.data())) {
+                // NG (user): typing "Applied" finds the follower's current entry too
+                if (Contains(a_name(i), search.data()) || (i == a_applied && Contains("Applied", search.data()))) {
                     shown.push_back(i);
                 }
             }
@@ -347,9 +351,15 @@ namespace Menu
             }
             for (int i : shown) {
                 PushID(i);
+                const float right = GetCursorPosX() + GetContentRegionAvail().x;  // the row's right edge
                 if (Selectable(std::string(a_name(i)).c_str(), i == a_current)) {
                     picked = i;
                     CloseCurrentPopup();
+                }
+                if (i == a_applied) {
+                    SameLine();
+                    SetCursorPosX(right - CalcTextSize("Applied").x - 4.0f);
+                    TextColored(kAppliedGreen, "Applied");
                 }
                 if (i == a_current && appearing) {
                     SetScrollHereY();
@@ -362,17 +372,22 @@ namespace Menu
         }
 
         // SearchCombo over Choices; returns the picked form ID or 0. a_none = text when a_current is not listed.
-        RE::FormID ChoiceSearchCombo(const char* a_id, const std::vector<LF::Choice>& a_list, RE::FormID a_current, const char* a_none = "(none)")
+        // a_applied: the follower's applied form (0 = none) - marked "Applied" in the list.
+        RE::FormID ChoiceSearchCombo(const char* a_id, const std::vector<LF::Choice>& a_list, RE::FormID a_current, const char* a_none = "(none)",
+            RE::FormID a_applied = 0)
         {
             int cur = -1;
+            int applied = -1;
             for (int i = 0; i < static_cast<int>(a_list.size()); ++i) {
-                if (a_list[i].id == a_current) {
+                if (a_list[i].id == a_current && cur < 0) {
                     cur = i;
-                    break;
+                }
+                if (a_applied && a_list[i].id == a_applied && applied < 0) {
+                    applied = i;
                 }
             }
             const int picked = SearchCombo(a_id, cur >= 0 ? a_list[cur].name.c_str() : a_none, static_cast<int>(a_list.size()), cur,
-                [&](int i) -> std::string_view { return a_list[i].name; });
+                [&](int i) -> std::string_view { return a_list[i].name; }, applied);
             return picked >= 0 ? a_list[picked].id : 0;
         }
 
@@ -972,6 +987,10 @@ namespace Menu
             Section("Appearance", "Pick name, preset, race and voice, then Apply Settings (the MCM's \"Apply settings\").\n"
                                   "Your choices stay while you look at other followers or pages until you apply them.");
             auto& e = CurrentEdit(snap);
+            // NG (user, 137): what the follower has now (an active follower only) - "Applied" in the drop-downs and next to Apply Settings
+            Edit applied = FromSlot(snap, g_selected);
+            applied.presetFile = s.preset.empty() ? std::string{} : s.preset + ".jslot";  // (137c) its real preset - FromSlot falls back to the first one (hidden preset)
+            const bool hasApplied = s.Active();
             BeginRow("Name", s.real ? "The NPC's name in game (nameplate, talk menu, subtitles) - applied with Apply Settings.\nIts recorded voice still says its own name; Remove gives it back."
                                     : "The follower's name (applied with Apply Settings).");
             if (InputText("##v", e.name.data(), e.name.size())) {
@@ -985,13 +1004,17 @@ namespace Menu
                 TextDisabled("No presets in CharGen/Exported");
             } else {
                 int cur = -1;
+                int appliedPreset = -1;
                 for (int i = 0; i < static_cast<int>(lists.presets.size()); ++i) {
                     if (lists.presets[i] == e.presetFile) {
                         cur = i;
                     }
+                    if (hasApplied && lists.presets[i] == applied.presetFile) {
+                        appliedPreset = i;
+                    }
                 }
                 if (const int p = SearchCombo("##v", e.presetFile.c_str(), static_cast<int>(lists.presets.size()), cur,
-                        [&](int i) -> std::string_view { return lists.presets[i]; });
+                        [&](int i) -> std::string_view { return lists.presets[i]; }, appliedPreset);
                     p >= 0) {
                     e.presetFile = lists.presets[p];
                     // NG (user): picking a preset also puts its name in Name (Jenny.jslot -> "Jenny"; can still be typed over)
@@ -1009,19 +1032,10 @@ namespace Menu
             }
             EndRowNoReset();
             BeginRow("Race", "Every playable race of your load order (rebuilt each time this page opens),\nplus races of NPCs you looked at when opening the page.\n"
-                             "The preset's own race (found from its head parts) is listed first and picked when you pick a preset.");
+                             "Picking a preset picks its own race (found from its head parts). [plugin] = a race from a mod.");
             {
-                // NG (user): the preset's race first in the list, marked
-                std::vector<LF::Choice> races = lists.races;
-                if (auto it = lists.presetRaces.find(e.presetFile); it != lists.presetRaces.end()) {
-                    if (auto r = std::find_if(races.begin(), races.end(), [&](const LF::Choice& c) { return c.id == it->second; }); r != races.end()) {
-                        LF::Choice first = *r;
-                        first.name += "  (preset's race)";
-                        races.erase(r);
-                        races.insert(races.begin(), std::move(first));
-                    }
-                }
-                if (auto id = ChoiceSearchCombo("##v", races, e.race)) {
+                // NG (user, 133): no "(preset's race)" mark and no moving it first any more - the plain sorted list
+                if (auto id = ChoiceSearchCombo("##v", lists.races, e.race, "(none)", hasApplied ? applied.race : 0)) {
                     e.race = id;
                     Touched(e);
                 }
@@ -1037,14 +1051,18 @@ namespace Menu
                                         "Picking a preset picks the Erin preset with the same name, when there is one.\n"
                                         "Shown only while an Erin race is picked. Remove takes it off again.");
                 int cur = 0;  // 0 = (none)
+                int appliedErin = hasApplied && applied.erinPreset.empty() && lists.erinRaces.contains(applied.race) ? 0 : -1;
                 for (int i = 0; i < static_cast<int>(lists.erinPresets.size()); ++i) {
                     if (_stricmp(lists.erinPresets[i].c_str(), e.erinPreset.c_str()) == 0) {
                         cur = i + 1;
                     }
+                    if (hasApplied && !applied.erinPreset.empty() && _stricmp(lists.erinPresets[i].c_str(), applied.erinPreset.c_str()) == 0) {
+                        appliedErin = i + 1;
+                    }
                 }
                 const auto shown = cur ? lists.erinPresets[cur - 1] : std::string("(none)");
                 if (const int p = SearchCombo("##erin", shown.c_str(), static_cast<int>(lists.erinPresets.size()) + 1, cur,
-                        [&](int i) -> std::string_view { return i ? std::string_view(lists.erinPresets[i - 1]) : std::string_view("(none)"); });
+                        [&](int i) -> std::string_view { return i ? std::string_view(lists.erinPresets[i - 1]) : std::string_view("(none)"); }, appliedErin);
                     p >= 0) {
                     e.erinPreset = p ? lists.erinPresets[p - 1] : std::string{};
                     Touched(e);
@@ -1052,14 +1070,14 @@ namespace Menu
                 EndRowNoReset();
             }
             // two lists like the MCM's; the follower gets the voice picked last (the other shows "(none)")
-            BeginRow("Female Voice", "Starred voices are vanilla follower-friendly.\nVoices of NPCs you looked at when opening the page are added.\nThe follower gets the voice you picked last (female, male or other list).");
-            if (auto id = ChoiceSearchCombo("##v", lists.femaleVoices, e.voice)) {
+            BeginRow("Female Voice", "Starred voices are vanilla follower-friendly.\nLazy Followers' own voice list - every other voice (modded, unique, NPCs you met) is under Other Voice.\nThe follower gets the voice you picked last (female, male or other list).");
+            if (auto id = ChoiceSearchCombo("##v", lists.femaleVoices, e.voice, "(none)", hasApplied ? applied.voice : 0)) {
                 e.voice = id;
                 Touched(e);
             }
             EndRowNoReset();
-            BeginRow("Male Voice", "Starred voices are vanilla follower-friendly.\nVoices of NPCs you looked at when opening the page are added.\nThe follower gets the voice you picked last (female, male or other list).");
-            if (auto id = ChoiceSearchCombo("##v", lists.maleVoices, e.voice)) {
+            BeginRow("Male Voice", "Starred voices are vanilla follower-friendly.\nLazy Followers' own voice list - every other voice (modded, unique, NPCs you met) is under Other Voice.\nThe follower gets the voice you picked last (female, male or other list).");
+            if (auto id = ChoiceSearchCombo("##v", lists.maleVoices, e.voice, "(none)", hasApplied ? applied.voice : 0)) {
                 e.voice = id;
                 Touched(e);
             }
@@ -1069,7 +1087,7 @@ namespace Menu
                                     "The follower gets the voice you picked last (female, male or other list).\n"
                                     "A modded voice (e.g. Sofia's): the follower uses its mod's lines; see Override the modded follower voiced .esp\n"
                                     "(shown when such a voice is picked).");
-            if (auto id = ChoiceSearchCombo("##v", lists.otherVoices, e.voice)) {
+            if (auto id = ChoiceSearchCombo("##v", lists.otherVoices, e.voice, "(none)", hasApplied ? applied.voice : 0)) {
                 e.voice = id;
                 Touched(e);
             }
@@ -1107,12 +1125,15 @@ namespace Menu
                              "A voice picked that needs no Override (e.g. EvenToned): this box hides and Apply Settings gives\n"
                              "the NPC back the same way - the free slot gets the picked voice.\n"
                              "Another modded follower's voice picked (box ticked) + Apply Settings: this NPC is given back and\n"
-                             "that voice's own NPC becomes the follower with this preset, race and name (gear and Keep boxes go along)."
-                           : "Off: the follower only borrows the voice - its mod's lines are swapped in; the voice's own NPC\n"
+                             "that voice's own NPC becomes the follower with this preset, race and name (gear and Keep boxes go along).\n"
+                             "An NPC with its own follower system (e.g. Sofia): recruit, wait and dismiss it with its own dialogue;\n"
+                             "follower frameworks like NFF do not list it."
+                           :"Off: the follower only borrows the voice - its mod's lines are swapped in; the voice's own NPC\n"
                              "(e.g. Sofia) stays as it is. Several followers can share one voice.\n"
                              "On: Apply Settings makes the voice's own NPC the follower with this preset, race and name -\n"
                              "its own voice, dialogue, quests and scripts (its look changes while it is your follower);\n"
                              "this slot goes back to storage. One follower per voice; untick it there (or Remove) to give the NPC back.\n"
+                             "An NPC with its own follower system (e.g. Sofia) follows through its own dialogue - NFF does not list it.\n"
                              "Shown only for a modded follower's voice whose own NPC is in your game.",
                     false);  // its long name does not widen the section's column (no gap jump when it shows / hides)
                 bool v = e.takeOver;
@@ -1138,6 +1159,24 @@ namespace Menu
                     req.erinPreset = erinRace ? e.erinPreset : std::string{};  // another race: no Erin preset (the old one is taken off)
                     LF::Apply(g_selected, std::move(req));
                 }
+            }
+            // NG (user, 136): green "Applied" next to the button while the Appearance choices are what the follower has
+            // (any change in Appearance takes it away; picking the same values again brings it back)
+            {
+                const bool same = hasApplied && std::string_view(e.name.data()) == std::string_view(applied.name.data()) &&
+                                  e.presetFile == applied.presetFile && e.race == applied.race && e.voice == applied.voice &&
+                                  (e.takeOver && (showOverride || s.real)) == applied.takeOver && (!erinRace || e.erinPreset == applied.erinPreset);
+                if (same) {
+                    SameLine();
+                    TextColored(kAppliedGreen, "Applied");
+                }
+            }
+            // NG (user, 136): the own-follower-system warning as a line under Apply Settings (was a note in the result
+            // line) - while the picked voice's own NPC has a follower system of its own mod (Lists::ownSystemVoices)
+            if (showOverride && lists.ownSystemVoices.contains(e.voice)) {
+                TextColored(kWarnOrange, "When Override is ticked this follower has its own follower system.");
+                Tooltip("Its own mod handles following (e.g. Sofia): recruit, wait and dismiss it with its own dialogue.\n"
+                        "Follower frameworks like NFF do not list it (Walk With Me does).");
             }
             if (openMove) {
                 OpenPopup("Override already in use##moveOverride");
@@ -1190,6 +1229,18 @@ namespace Menu
                 NextTo("Teleport to NPC");
                 if (ConfirmButton("Teleport to NPC", "Teleports you to the follower.", std::format("Teleport to {}?", who))) {
                     LF::TeleportTo(g_selected);
+                }
+            }
+            if (s.Active() && live.enabled) {  // NG (user): storage without losing anything (a taken-over NPC: sent home)
+                NextTo("Storage");
+                if (ConfirmButton("Storage", s.real ? "Sends the NPC home (its own place in the world - its own quests keep working); it stays taken over:\n"
+                                                      "preset, name, voice, stats, spells and gear are KEPT (Remove gives it back). It stops following\n"
+                                                      "first (its own mod's dismiss). Summon NPC brings it back. Settings > Hotkey > Storage does the same."
+                                                    : "Sends the follower to the Lazy Followers storage - preset, name, voice, stats, spells and gear are KEPT\n"
+                                                      "(Remove resets them). It stops following first. Summon NPC brings it back as it was.\n"
+                                                      "Settings > Hotkey > Storage does the same for the follower you look at.",
+                        s.real ? std::format("Send {} home? (everything kept, still taken over)", who) : std::format("Send {} to storage? (everything kept)", who))) {
+                    LF::Store(g_selected);
                 }
             }
             NextTo("Remove");
@@ -2225,6 +2276,15 @@ namespace Menu
             FlagRow("Custom Spells", "Off greys out the Spells page. Spells already added stay on the followers.",
                 LF::SpellsEnabled(), LF::SetSpellsEnabled);
 
+            // NG (user): the every-item inventory lists as options (game 1.6.1170 only)
+            Section("Inventory");
+            FlagRow("Full Inventory Player", "Your inventory (Tab / I, and your side of Open Inventory) lists every item you carry,\n"
+                                             "also non-playable ones (skins, mod items). Off: the game's normal list.",
+                LF::FullInventoryPlayer(), LF::SetFullInventoryPlayer);
+            FlagRow("Full Inventory NPC", "The NPC's side of Open Inventory lists every item it carries, also its worn outfit pieces\n"
+                                          "and non-playable items. Off: the game's normal list (like a follower's trade).",
+                LF::FullInventoryNPC(), LF::SetFullInventoryNPC);
+
             std::error_code ec;
             Section("Config Data", "Voices, races and the 10 combat styles (Data/SKSE/Plugins/LazyFollowers/LazyFollowersConfig.json).");
             if (Show("Load Config Save Config")) {
@@ -2277,6 +2337,10 @@ namespace Menu
                 Hotkey::Key::kSummon, LF::SummonKey(), LF::SetSummonKey);
             HotkeyRow("Summon All", "Summons every follower that is not following you (like the Summon All button).",
                 Hotkey::Key::kSummonAll, LF::SummonAllKey(), LF::SetSummonAllKey);
+            HotkeyRow("Storage", "Sends the follower you look at to storage (like the Followers page's Storage button) - preset, name,\n"
+                                 "voice, stats, spells and gear are kept; Summon NPC / Summon Follower bring it back.\n"
+                                 "Looking at no follower: the follower selected on the Followers page. A taken-over NPC is sent home instead.",
+                Hotkey::Key::kStore, LF::StoreKey(), LF::SetStoreKey);
             HotkeyRow("Save Player Preset", "Asks for a name, then saves YOUR look as a preset (like the console's skee preset-save <name>):\n"
                                             "the .jslot + the face tint .dds in the CharGen Exported folders, so it shows in the Preset list.\n"
                                             "Enter saves, Esc cancels.",

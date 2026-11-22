@@ -73,6 +73,12 @@ namespace LF
         std::int32_t textInstance = -1;
         float        textTemper = 1.0f;
 
+        // NG (user video 2026-11-21 15-36-10: Sofia naked after a give-back): a real NPC's own armor / weapons / ammo
+        // taken off at the take-over (TransferGear) - form + count, and which of them it wore; given back on give-back
+        // (RestoreRealLook). Co-save OWNG.
+        std::vector<std::pair<RE::FormID, std::int32_t>> ownGear;
+        std::vector<RE::FormID>                          ownWorn;
+
         bool Active() const { return !preset.empty(); }
         bool Listed() const { return Active() || added; }  // shown in the Follower drop-down
     };
@@ -92,6 +98,7 @@ namespace LF
         std::vector<Choice>      femaleVoices;  // _LazyFollowersFemaleVoices + voices met
         std::vector<Choice>      maleVoices;
         std::vector<Choice>      otherVoices;   // NG: every other voice type of the load order (modded voices...)
+        std::unordered_set<RE::FormID> ownSystemVoices;  // NG (user, 136): owned voices whose NPC's plugin has its own follower system (Sofia's) - the line under Apply Settings
         std::unordered_set<RE::FormID> ownedVoices;  // NG (user): modded voices a unique NPC of the game uses (e.g. Sofia's) - the Override box shows for them
         std::vector<Choice>      classes;       // _LazyFollowersClasses
         std::vector<Choice>      spells;        // _LazyFollowersSpells (+ all playable spells when loaded)
@@ -190,6 +197,10 @@ namespace LF
     void SetClassesEnabled(bool a_on);
     bool SpellsEnabled();      // new: off greys out the Spells page (spells already added stay)
     void SetSpellsEnabled(bool a_on);
+    bool FullInventoryPlayer();  // NG (user): your inventory lists every item (non-playable / outfit items too; default on)
+    void SetFullInventoryPlayer(bool a_on);
+    bool FullInventoryNPC();     // NG (user): an NPC's side of Open Inventory lists every item (default on)
+    void SetFullInventoryNPC(bool a_on);
     bool AutoEquip();
     void SetAutoEquip(bool a_on);
     bool IncludeEquipment();   // NG (user): Copy Kit copies the worn armor / weapons too (default on)
@@ -228,6 +239,8 @@ namespace LF
     void       SetSummonKey(KeyBinding a_key);
     KeyBinding SummonAllKey();   // NG (user): Summon All hotkey - every follower not following you (like Summon All)
     void       SetSummonAllKey(KeyBinding a_key);
+    KeyBinding StoreKey();       // NG (user): Storage hotkey - sends a follower to storage, its settings kept
+    void       SetStoreKey(KeyBinding a_key);
     KeyBinding SavePresetKey();  // NG (user): Save Player Preset hotkey - name dialog, then RaceMenu's player save
     void       SetSavePresetKey(KeyBinding a_key);
     KeyBinding OpenInventoryKey();  // NG (user): Open Inventory hotkey - the inventory of the actor ticked in Nearby Actors
@@ -258,6 +271,8 @@ namespace LF
     void SetClass(int a_slot, RE::FormID a_class);
     void Summon(int a_slot);
     void SummonSelected();                         // the Summon hotkey: the pages' selected follower (else the first listed)
+    void Store(int a_slot);                        // NG (user): to storage, settings kept (dismissed, moved to the storage cell, disabled)
+    void StoreSelected();                          // NG (user): Storage hotkey - the slot follower you look at, else the pages' selected one
     std::string_view InventoryMenuFor(RE::FormID a_ref);  // InventoryMenu for the player, else ContainerMenu
     void ResetPovHold();                           // NG: a window closed - the game's "Toggle POV held" (fovSlideMode) off (its key release went to the window)
     void OpenInventory(RE::FormID a_ticked, int a_tries = 0);  // NG (user): Open Inventory hotkey - the ticked actor (an open one is closed first)

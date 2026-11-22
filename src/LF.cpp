@@ -147,6 +147,9 @@ namespace LF
         std::unordered_set<RE::FormID> g_restoring;  // main thread: real NPCs whose give-back (RestoreRealLook) still runs
         bool g_allSpells = false;
         bool g_spellsEnabled = true;               // new (Settings): off greys out the Spells page
+        // NG (user): Settings > Full Inventory Player / NPC - the inventory hooks' every-item lists (read by the hooks)
+        std::atomic<bool> g_fullInvPlayer{ true };
+        std::atomic<bool> g_fullInvNpc{ true };
         float g_scanRadius = kDefaultScanRadius;   // Nearby Actors scan radius (metres)
         int   g_nearbyRows = kDefaultNearbyRows;   // Nearby Actors table rows before it scrolls
         std::vector<float>         g_nearbyWidths;  // Nearby Actors column widths (empty = default)
@@ -155,6 +158,7 @@ namespace LF
         std::atomic<std::uint64_t> g_openKey{ 0 };  // Open Window hotkey: vk | mods << 32 (read by the hotkey thread)
         std::atomic<std::uint64_t> g_summonKey{ 0 };  // Summon hotkey, same layout
         std::atomic<std::uint64_t> g_summonAllKey{ 0 };  // Summon All hotkey, same layout
+        std::atomic<std::uint64_t> g_storeKey{ 0 };      // NG (user): Storage hotkey, same layout
         std::atomic<std::uint64_t> g_savePresetKey{ 0 };  // Save Player Preset hotkey, same layout
         std::atomic<std::uint64_t> g_openInvKey{ 0 };     // NG (user): Open Inventory hotkey, same layout
         std::atomic<std::uint64_t> g_nearbyWinKey{ 0 };   // NG (user): Nearby Actors Window hotkey, same layout
@@ -604,6 +608,11 @@ namespace LF
             }
             int n = 0;
             for (auto list : dh->GetFormArray<RE::BGSListForm>()) {
+                // (133, user video 18-24-57: Sofia's voice in Female Voice) not Lazy Followers' own Female / Male Voices
+                // lists - they hold FemaleEvenToned too, and an addition stays in the save
+                if (list == g_femaleVoicesList || list == g_maleVoicesList) {
+                    continue;
+                }
                 if (list && list->HasForm(tmpl) && !list->HasForm(a_voice)) {
                     list->AddForm(a_voice);
                     ++n;
@@ -1559,18 +1568,344 @@ namespace LF
             Out(std::format("{} - Erin preset taken off (Erin skin + extra tints unregistered, checked again)", DisplayName(a_actor)));
         }
 
+        // NG (user video 2026-11-21 15-36-10: Sofia given back, then she teleported back to the player): a real NPC
+        // that follows you through its own mod stays recruited there after a give-back, and that mod's catch-up
+        // (Sofia: SofiaCatchUpEnabled / SofiaCatchUpDistance 3000) brings it back. Its own dismiss is used: every
+        // quest it fills an alias of whose script has DismissFollower (vanilla FollowerScript clones, Sofia's
+        // SofiaFollowerScript: DismissFollower(Int iMessage, Int iSayLine)). Main thread.
+        struct DismissCall
+        {
+            RE::TESQuest* quest;
+            std::string   script;
+            std::uint32_t params;  // 0 or 2 (Int iMessage = -1 = no message, Int iSayLine = 0 = no line)
+        };
+
+        std::vector<DismissCall> FindOwnDismiss(RE::Actor* a_actor)
+        {
+            std::vector<DismissCall> out;
+            auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+            auto policy = vm ? vm->GetObjectHandlePolicy() : nullptr;
+            auto extra = a_actor ? a_actor->extraList.GetByType<RE::ExtraAliasInstanceArray>() : nullptr;
+            if (!policy || !extra) {
+                return out;
+            }
+            std::vector<RE::TESQuest*> quests;
+            {
+                RE::BSReadLockGuard lock(extra->lock);
+                for (auto inst : extra->aliases) {
+                    if (inst && inst->quest && std::find(quests.begin(), quests.end(), inst->quest) == quests.end()) {
+                        quests.push_back(inst->quest);
+                    }
+                }
+            }
+            for (auto quest : quests) {
+                const auto handle = policy->GetHandleForObject(quest->GetFormType(), quest);
+                if (handle == policy->EmptyHandle()) {
+                    continue;
+                }
+                RE::BSSpinLockGuard lock(vm->attachedScriptsLock);
+                auto                it = vm->attachedScripts.find(handle);
+                if (it == vm->attachedScripts.end()) {
+                    continue;
+                }
+                for (auto& script : it->second) {
+                    auto obj = script.get();
+                    // (127b, user: (127) did nothing - Sofia was no player teammate, so nothing was checked) only a
+                    // script whose ReferenceAlias property holds a_actor (its follower alias, Sofia: pFollowerAlias):
+                    // filling it = recruited in that mod, and DismissFollower acts on that alias
+                    bool holds = false;
+                    for (auto type = obj ? obj->GetTypeInfo() : nullptr; type && !holds; type = type->GetParent()) {
+                        auto props = type->GetPropertyIter();
+                        for (std::uint32_t i = 0; props && i < type->GetNumProperties() && !holds; ++i) {
+                            auto var = obj->GetProperty(props[i].name);
+                            if (var && var->IsObject()) {  // (Unpack: a None object gives nullptr)
+                                auto alias = var->Unpack<RE::BGSRefAlias*>();
+                                holds = alias && alias->GetActorReference() == a_actor;
+                            }
+                        }
+                    }
+                    if (!holds) {
+                        continue;
+                    }
+                    for (auto type = obj ? obj->GetTypeInfo() : nullptr; type; type = type->GetParent()) {
+                        auto funcs = type->GetMemberFuncIter();
+                        bool found = false;
+                        for (std::uint32_t i = 0; funcs && i < type->GetNumMemberFuncs(); ++i) {
+                            auto f = funcs[i].func.get();
+                            if (!f || f->GetName() != "DismissFollower") {
+                                continue;
+                            }
+                            const auto n = f->GetParamCount();
+                            bool       ints = true;
+                            for (std::uint32_t p = 0; p < n; ++p) {
+                                RE::BSFixedString        pname;
+                                RE::BSScript::TypeInfo   ptype;
+                                f->GetParam(p, pname, ptype);
+                                ints = ints && ptype.GetRawType() == RE::BSScript::TypeInfo::RawType::kInt;
+                            }
+                            if (n == 0 || (n == 2 && ints)) {
+                                out.push_back({ quest, obj->GetTypeInfo()->GetName(), n });
+                            } else {
+                                logger::info("{} - {}.DismissFollower has {} parameters - not called", DisplayName(a_actor), obj->GetTypeInfo()->GetName(), n);
+                            }
+                            found = true;
+                            break;
+                        }
+                        if (found) {
+                            break;
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        // NG (user: "a warning when Override is used on such modded actors"): the script of a_actor's own follower system
+        // ("" = none): the quest script with DismissFollower whose follower alias it fills now (FindOwnDismiss), else
+        // one from a quest of its own plugin (not recruited yet - e.g. Sofia's SofiaFollowerScript). Main thread.
+        // (130b) Only quests of the NPC's OWN plugin count: Skyrim's DialogueFollower (Skyrim.esm, NFF hooks it) has
+        // DismissFollower too and holds Vicky (Cubbi, recruited by vanilla dialogue) - no warning for her. NPCs of the
+        // base game files are skipped (Skyrim.esm would always match DialogueFollower).
+        std::string PluginFollowerScript(const RE::TESFile* a_file);
+
+        std::string OwnFollowerSystem(RE::Actor* a_actor)
+        {
+            auto npc = a_actor ? a_actor->GetActorBase() : nullptr;
+            auto file = npc ? npc->GetFile(0) : nullptr;
+            if (!file) {
+                return {};
+            }
+            for (std::string_view base : { "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm" }) {
+                if (_stricmp(std::string(file->GetFilename()).c_str(), std::string(base).c_str()) == 0) {
+                    return {};
+                }
+            }
+            for (const auto& c : FindOwnDismiss(a_actor)) {
+                if (c.quest->GetFile(0) == file) {
+                    return c.script;
+                }
+            }
+            return PluginFollowerScript(file);
+        }
+
+        // (136) The follower-system script of a plugin's own quests ("" = none, base game files: none) - per plugin,
+        // kept until the next load (g_pluginFollowerScripts, cleared in OnGameLoaded). Main thread.
+        std::unordered_map<const RE::TESFile*, std::string> g_pluginFollowerScripts;
+
+        std::string PluginFollowerScript(const RE::TESFile* a_file)
+        {
+            if (!a_file) {
+                return {};
+            }
+            for (std::string_view base : { "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm" }) {
+                if (_stricmp(std::string(a_file->GetFilename()).c_str(), std::string(base).c_str()) == 0) {
+                    return {};
+                }
+            }
+            if (auto it = g_pluginFollowerScripts.find(a_file); it != g_pluginFollowerScripts.end()) {
+                return it->second;
+            }
+            std::string found;
+            auto        file = a_file;
+            auto dh = RE::TESDataHandler::GetSingleton();
+            auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+            auto policy = vm ? vm->GetObjectHandlePolicy() : nullptr;
+            if (!dh || !policy) {
+                return {};
+            }
+            for (auto quest : dh->GetFormArray<RE::TESQuest>()) {
+                if (!found.empty()) {
+                    break;
+                }
+                if (!quest || quest->GetFile(0) != file) {
+                    continue;
+                }
+                const auto handle = policy->GetHandleForObject(quest->GetFormType(), quest);
+                if (handle == policy->EmptyHandle()) {
+                    continue;
+                }
+                RE::BSSpinLockGuard lock(vm->attachedScriptsLock);
+                auto                it = vm->attachedScripts.find(handle);
+                if (it == vm->attachedScripts.end()) {
+                    continue;
+                }
+                for (auto& script : it->second) {
+                    auto obj = script.get();
+                    for (auto type = obj ? obj->GetTypeInfo() : nullptr; type; type = type->GetParent()) {
+                        auto funcs = type->GetMemberFuncIter();
+                        for (std::uint32_t i = 0; funcs && i < type->GetNumMemberFuncs(); ++i) {
+                            if (funcs[i].func && funcs[i].func->GetName() == "DismissFollower" && found.empty()) {
+                                found = obj->GetTypeInfo()->GetName();
+                            }
+                        }
+                    }
+                }
+            }
+            if (!found.empty()) {
+                g_pluginFollowerScripts[a_file] = found;  // only hits: scripts may not be bound yet early in a load
+            }
+            return found;
+        }
+
+        // The warning added to the take-over notice for such an NPC ("" = none).
+        std::string OwnFollowerWarning(RE::Actor* a_actor, const std::string& a_name)
+        {
+            const auto script = OwnFollowerSystem(a_actor);
+            if (script.empty()) {
+                return {};
+            }
+            // (136, user) the warning is a line under Apply Settings now (Lists::ownSystemVoices) - only the log here
+            Out(std::format("{} has its own follower system ({})", a_name, script));
+            return {};
+        }
+
+        // For the log: a_actor's follower state - teammate, CurrentFollowerFaction rank, the quests it fills aliases of.
+        std::string FollowState(RE::Actor* a_actor)
+        {
+            std::string quests;
+            if (auto extra = a_actor->extraList.GetByType<RE::ExtraAliasInstanceArray>()) {
+                RE::BSReadLockGuard lock(extra->lock);
+                for (auto inst : extra->aliases) {
+                    if (inst && inst->quest) {
+                        const char* e = inst->quest->GetFormEditorID();
+                        quests += std::format("{}{} {:08X}", quests.empty() ? "" : ", ", e && *e ? e : "?", inst->quest->GetFormID());
+                    }
+                }
+            }
+            return std::format("teammate {}, CurrentFollowerFaction rank {}, aliases of: {}", a_actor->IsPlayerTeammate() ? "yes" : "no",
+                g_followerFaction ? a_actor->GetFactionRank(g_followerFaction, false) : -9, quests.empty() ? "none" : quests);
+        }
+
+        // Chain steps (before the give-back moves it home): a_actor is dismissed in its own mod when it still
+        // follows you there (fills the follower alias of a quest script with DismissFollower) - its own
+        // DismissFollower, then teammate off if it still is one.
+        void AddOwnDismiss(Papyrus::Chain& a_chain, RE::Actor* a_actor)
+        {
+            if (!a_actor) {
+                return;
+            }
+            const auto calls = FindOwnDismiss(a_actor);
+            const auto name = DisplayName(a_actor);
+            Out(std::format("{} before it leaves you (give-back / storage): {}", name, FollowState(a_actor)));
+            for (auto& c : calls) {
+                Out(std::format("{} still follows you - dismissed with {}.DismissFollower (quest {:08X})", name, c.script, c.quest->GetFormID()));
+                a_chain.Then([c](Papyrus::Done d) {
+                    return c.params == 2 ? Papyrus::CallMethod(c.quest, c.script, "DismissFollower", d, std::int32_t(-1), std::int32_t(0)) :
+                                           Papyrus::CallMethod(c.quest, c.script, "DismissFollower", d);
+                });
+            }
+            a_chain.Then([a_actor, name, none = calls.empty()](Papyrus::Done d) {
+                if (!a_actor->IsPlayerTeammate()) {
+                    return false;
+                }
+                Out(std::format("{} - {}: player teammate turned off", name, none ? "no follower alias of its own mod" : "still a teammate after its own dismiss"));
+                return Papyrus::CallMethod(a_actor, "Actor", "SetPlayerTeammate", d, false, true);
+            });
+        }
+
+        // NG (user: an Override NPC "should be detectable"): Walk With Me (Wayfarer.dll 0.3.1, REA 2026-11-21) only
+        // lists a follower that is in NFF's active roster when NFF is installed (its eligibility check rejects
+        // everything else with "not in NFF's active follower roster"); a real NPC following through its own mod
+        // never is. Its documented way for such followers: Wayfarer.RegisterFollower while it follows,
+        // UnregisterFollower when it stops (registrations are lost at a load and made again). Checked every 2 s.
+        std::unordered_set<RE::FormID> g_wwmRegistered;  // main thread
+        std::unordered_map<RE::FormID, std::string> g_wwmLastState;  // (127b) last logged follow state per real NPC
+
+        // Walk With Me's Papyrus API is installed.
+        bool HasWayfarer()
+        {
+            static int has = -1;
+            if (has < 0) {
+                has = Papyrus::HasFunction("Wayfarer", "RegisterFollower") ? 1 : 0;
+                if (has) {
+                    logger::info("Walk With Me found - taken-over NPCs that follow you are registered with it");
+                }
+            }
+            return has == 1;
+        }
+
+        // Takes a_id out of Walk With Me (give-back / not following any more).
+        void WwmUnregister(RE::FormID a_id)
+        {
+            if (!g_wwmRegistered.erase(a_id)) {
+                return;
+            }
+            if (auto actor = RE::TESForm::LookupByID<RE::Actor>(a_id)) {
+                Out(std::format("{} - unregistered from Walk With Me", DisplayName(actor)));
+                Papyrus::CallStatic("Wayfarer", "UnregisterFollower", {}, actor);
+            }
+        }
+
+        // The 2 s check: real NPC entries that follow you (player teammate, or in the follower alias of their own
+        // mod - (127b) Sofia was in neither check as a teammate) in, the rest out.
+        void WwmSync()
+        {
+            if (!g_inGame.load() || !Papyrus::GameReady() || !HasWayfarer()) {
+                return;
+            }
+            std::unordered_set<RE::FormID> following;
+            std::vector<RE::FormID>        refs;
+            {
+                std::lock_guard lock(g_lock);
+                for (auto& s : g_slots) {
+                    if (s.real && s.Active() && s.ref) {
+                        refs.push_back(s.ref);
+                    }
+                }
+            }
+            for (auto id : refs) {
+                auto actor = RE::TESForm::LookupByID<RE::Actor>(id);
+                if (actor) {  // (127b) diagnostics: its follow state, logged when it changes
+                    auto state = FollowState(actor);
+                    if (auto& l = g_wwmLastState[id]; l != state) {
+                        Out(std::format("{} (taken over): {}", DisplayName(actor), state));
+                        l = std::move(state);
+                    }
+                }
+                // (137c) only an NPC with its own follower system (Sofia) - one that follows through Skyrim's / NFF's
+                // follower quest (Vicky = Cubbi) is already in NFF's roster; registering took it from the user's control
+                if (actor && !actor->IsDead() && !actor->IsDisabled() && !g_restoring.contains(id) && !OwnFollowerSystem(actor).empty() &&
+                    (actor->IsPlayerTeammate() || !FindOwnDismiss(actor).empty())) {
+                    following.insert(id);
+                }
+            }
+            for (auto id : std::vector<RE::FormID>(g_wwmRegistered.begin(), g_wwmRegistered.end())) {
+                if (!following.contains(id)) {
+                    WwmUnregister(id);
+                }
+            }
+            for (auto id : following) {
+                if (g_wwmRegistered.insert(id).second) {
+                    auto actor = RE::TESForm::LookupByID<RE::Actor>(id);
+                    Out(std::format("{} follows you - registered with Walk With Me", DisplayName(actor)));
+                    Papyrus::CallStatic("Wayfarer", "RegisterFollower", {}, actor, std::int32_t(-1));
+                }
+            }
+        }
+
+        // Runs WwmSync every 2 s while a game is loaded (After drops it at a load; OnGameLoaded starts it again).
+        void WwmLoop()
+        {
+            WwmSync();
+            After(2.0f, []() { WwmLoop(); });
+        }
+
         // NG 1.2: a real NPC's own look back (Remove): RaceMenu preset, body morphs and overlays off, its own race,
         // then its 3D rebuilt (Disable / Enable) so its own face shows again. Then (user: "Remove should remove the
         // follower, or move it away, like it already does") it goes back to its own place in the world
         // (MoveToMyEditorLocation) - not disabled, so its own mod keeps working.
         // a_erin: the Erin Preset it had ("" = none) - taken off once its own race is back (ResetErin).
-        void RestoreRealLook(RE::Actor* a_actor, RE::FormID a_race, RE::FormID a_skin, RE::FormID a_outfit, std::string a_erin = {})
+        // a_gear / a_worn: its own armor / weapons taken off at the take-over (Slot::ownGear) - given back, worn ones equipped.
+        void RestoreRealLook(RE::Actor* a_actor, RE::FormID a_race, RE::FormID a_skin, RE::FormID a_outfit, std::string a_erin = {},
+            std::vector<std::pair<RE::FormID, std::int32_t>> a_gear = {}, std::vector<RE::FormID> a_worn = {})
         {
             auto       npc = a_actor->GetActorBase();
             auto       race = Lookup<RE::TESRace>(a_race);
             auto       chain = Papyrus::Chain::Make();
             const bool shown = a_actor->Is3DLoaded() && !a_actor->IsDisabled();
             g_restoring.insert(a_actor->GetFormID());  // NG: a take-over of it waits until this has finished (Apply)
+            WwmUnregister(a_actor->GetFormID());       // NG: out of Walk With Me
+            AddOwnDismiss(*chain, a_actor);            // NG: dismissed in its own mod first (its catch-up brought it back)
             // crash fix: its head is taken away first, the head data swapped while it is gone
             if (shown) {
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Disable", d, false); });
@@ -1622,6 +1957,35 @@ namespace LF
                 });
                 chain->ThenDo([a_actor, a_erin]() { OnMain([a_actor, a_erin]() { ResetErin(a_actor, a_erin); }); });
             }
+            // NG (user: Sofia naked after a give-back - her clothes were inventory items, not her outfit, and the take-over
+            // had removed them): its own gear back, after the follower's gear left it (TransferGear runs alongside)
+            if (!a_gear.empty()) {
+                chain->Then(WaitStep(0.5f));
+                for (auto& [id, count] : a_gear) {
+                    chain->Then([a_actor, id, count](Papyrus::Done d) {
+                        auto form = RE::TESForm::LookupByID(id);
+                        return form && Papyrus::CallMethod(a_actor, "ObjectReference", "AddItem", d, form, count, true);
+                    });
+                }
+                for (auto id : a_worn) {
+                    chain->Then([a_actor, id](Papyrus::Done d) {
+                        auto form = RE::TESForm::LookupByID(id);
+                        return form && Papyrus::CallMethod(a_actor, "Actor", "EquipItem", d, form, false, true);
+                    });
+                }
+                std::string names;  // (129b) which ones, for the log
+                for (auto& [id, count] : a_gear) {
+                    auto        f = RE::TESForm::LookupByID(id);
+                    const char* n = f ? f->GetName() : nullptr;
+                    const bool  w = std::find(a_worn.begin(), a_worn.end(), id) != a_worn.end();
+                    names += std::format("{}{} {:08X} x{}{}", names.empty() ? "" : ", ", n && *n ? n : "?", id, count, w ? " (worn)" : "");
+                }
+                chain->ThenDo([name = DisplayName(a_actor), n = a_gear.size(), names]() {
+                    Out(std::format("{} - its own {} armor / weapon items given back: {}", name, n, names));
+                });
+            } else {
+                Out(std::format("{} - no own armor / weapons kept from its take-over (taken over before 1.4.1 build 128, or it had none)", DisplayName(a_actor)));
+            }
             chain->ThenDo([name = DisplayName(a_actor), id = a_actor->GetFormID()]() {
                 Out(std::format("{} - own look restored (preset cleared, 3D rebuilt), sent back to its own place", name));
                 OnMain([id]() { g_restoring.erase(id); });
@@ -1644,10 +2008,16 @@ namespace LF
             RE::FormID defOutfit = 0;
             const bool real = IsReal(a_slot);
             std::string hadErin;  // the Erin preset it had ("" = none)
+            std::vector<std::pair<RE::FormID, std::int32_t>> gear;
+            std::vector<RE::FormID>                          worn;
             {
                 std::lock_guard lock(g_lock);
                 auto&           s = g_slots[a_slot];
                 hadErin = s.erinPreset;
+                gear = std::move(s.ownGear);  // NG: a real NPC's own gear, given back (RestoreRealLook)
+                worn = std::move(s.ownWorn);
+                s.ownGear.clear();
+                s.ownWorn.clear();
                 s.name = s.defaultName;
                 s.preset.clear();
                 s.headMesh.clear();
@@ -1672,7 +2042,7 @@ namespace LF
                 if (MuManaged(actor)) {
                     Out(std::format("{} - look left to Mu Dynamic NPC Replacer (not cleared)", DisplayName(actor)));
                 } else {
-                    RestoreRealLook(actor, defRace, defSkin, defOutfit, hadErin);
+                    RestoreRealLook(actor, defRace, defSkin, defOutfit, hadErin, std::move(gear), std::move(worn));
                 }
                 return;
             }
@@ -1680,6 +2050,15 @@ namespace LF
                 return;
             }
             auto chain = Papyrus::Chain::Make();
+            // NG crash fix (user crash log 2026-11-21 17-02-18: Override on Ciel right after her preset; MuErinRace.dll
+            // SkinManager::setSkinOnHeadPartMeshes -> TESNPC::GetCurrentHeadPartByType read an empty head part of
+            // NordFemale01 while ClearPreset / SetRace rebuilt her head - the gear moving off her had just queued Erin's
+            // skin update): a slot going to storage (a_then = StoreSlot, it ends disabled anyway) is hidden FIRST, like
+            // the real NPC give-back (RestoreRealLook), so no head of it is rebuilt or skinned during the reset.
+            if (a_then && actor->Is3DLoaded() && !actor->IsDisabled()) {
+                chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "Disable", d, false); });
+                chain->Then(WaitStep(kSettle));
+            }
             if (MuManaged(actor)) {
                 Out(std::format("{} - look left to Mu Dynamic NPC Replacer (not cleared)", DisplayName(actor)));
             } else {
@@ -1839,6 +2218,15 @@ namespace LF
             return name;
         }
 
+        // NG (user): a voice's display name, plus " [plugin]" only for a voice from a mod (base game: no tag).
+        std::string VoiceLabel(const RE::BGSVoiceType* a_v, std::string a_name)
+        {
+            if (auto file = a_v ? a_v->GetFile(0) : nullptr; a_v && Voice::IsModded(a_v)) {
+                a_name = std::format("{} [{}]", a_name, file ? file->GetFilename() : "?"sv);
+            }
+            return a_name;
+        }
+
         // Builds the drop-down lists (main thread).
         void BuildLists()
         {
@@ -1891,66 +2279,29 @@ namespace LF
                 if (const auto name = RaceName(r); nameCount[name] > 1) {
                     const bool vampire = r->HasKeywordString("Vampire");
                     auto       file = r->GetFile(0);
-                    label = std::format("{}{} [{}]", name, vampire ? " (Vampire)" : "", file ? file->GetFilename() : "?"sv);
+                    label = std::format("{}{}", name, vampire ? " (Vampire)" : "");
+                    if (!BaseGameRaceFile(file)) {  // (133, user) [plugin] only for a race from a mod
+                        label = std::format("{} [{}]", label, file ? file->GetFilename() : "?"sv);
+                    }
                 }
                 l->races.push_back({ r->GetFormID(), std::move(label) });
             }
             std::sort(l->races.begin(), l->races.end(), [](const Choice& a, const Choice& b) { return a.name < b.name; });
 
-            // voices: the esp lists with the MCM's names, then voices met
-            // Fix (user GIF, 2nd try): the old mod's scripts added voices met to these FormLists, sorted by the
-            // NPC's sex (MaleEvenToned, FemaleChild...), and old saves still have them: entries after the esp's
-            // own ones must have the right Female flag and not be child voices (they stay in Other Voice)
-            auto fitsVoice = [](RE::TESForm* a_f, bool a_female) {
-                auto v = a_f ? a_f->As<RE::BGSVoiceType>() : nullptr;
-                if (!v || v->data.flags.all(RE::VOICE_TYPE_DATA::Flag::kFemale) != a_female) {
-                    return false;
-                }
-                std::string lower = VoiceName(v);
-                std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                return lower.find("child") == std::string::npos;
-            };
+            // NG (user, 135): Female / Male Voice = only Lazy Followers' own lists (the MCM's voices and names). Every other
+            // voice - met NPCs' voices, config voices, a follower's current voice, additions other mods / older versions
+            // made to these FLSTs in the save - is under Other Voice ([plugin] for mods). They used to drop into Female /
+            // Male "sometimes" (whenever met / used) and leave Other Voice.
             auto fv = ListForms(g_femaleVoicesList);
-            for (std::size_t i = 0; i < fv.size(); ++i) {
-                if (fv[i] && (i < kFemaleVoiceNames.size() || fitsVoice(fv[i], true))) {
-                    AddChoice(l->femaleVoices, fv[i]->GetFormID(), i < kFemaleVoiceNames.size() ? kFemaleVoiceNames[i] : VoiceName(fv[i]->As<RE::BGSVoiceType>()));
+            for (std::size_t i = 0; i < fv.size() && i < kFemaleVoiceNames.size(); ++i) {
+                if (fv[i]) {
+                    AddChoice(l->femaleVoices, fv[i]->GetFormID(), kFemaleVoiceNames[i]);
                 }
             }
             auto mv = ListForms(g_maleVoicesList);
-            for (std::size_t i = 0; i < mv.size(); ++i) {
-                if (mv[i] && (i < kMaleVoiceNames.size() || fitsVoice(mv[i], false))) {
-                    AddChoice(l->maleVoices, mv[i]->GetFormID(), i < kMaleVoiceNames.size() ? kMaleVoiceNames[i] : VoiceName(mv[i]->As<RE::BGSVoiceType>()));
-                }
-            }
-            {
-                std::lock_guard lock(g_lock);
-                // voices met / from the config file: only voices whose Female flag fits the list (fix: older
-                // saves put male voices met on female-made slots into Female Voice); child voices not at all
-                auto fits = [](const Choice& a_c, bool a_female) {
-                    auto v = Lookup<RE::BGSVoiceType>(a_c.id);
-                    if (!v || v->data.flags.all(RE::VOICE_TYPE_DATA::Flag::kFemale) != a_female) {
-                        return false;
-                    }
-                    std::string lower = a_c.name;
-                    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                    return lower.find("child") == std::string::npos;
-                };
-                for (auto& c : g_extraFemaleVoices) {
-                    if (fits(c, true)) {
-                        AddChoice(l->femaleVoices, c.id, c.name);
-                    }
-                }
-                for (auto& c : g_extraMaleVoices) {
-                    if (fits(c, false)) {
-                        AddChoice(l->maleVoices, c.id, c.name);
-                    }
-                }
-                // a follower's current voice is always pickable
-                for (auto& s : g_slots) {
-                    if (auto v = Lookup<RE::BGSVoiceType>(s.voice)) {
-                        const bool female = v->data.flags.all(RE::VOICE_TYPE_DATA::Flag::kFemale);
-                        AddChoice(female ? l->femaleVoices : l->maleVoices, v->GetFormID(), VoiceName(v));
-                    }
+            for (std::size_t i = 0; i < mv.size() && i < kMaleVoiceNames.size(); ++i) {
+                if (mv[i]) {
+                    AddChoice(l->maleVoices, mv[i]->GetFormID(), kMaleVoiceNames[i]);
                 }
             }
             // NG: Other Voice = every other voice type of the load order (modded / unlisted voices), sorted
@@ -1963,8 +2314,7 @@ namespace LF
                 }
                 for (auto v : dh->GetFormArray<RE::BGSVoiceType>()) {
                     if (v && !listed.contains(v->GetFormID())) {
-                        auto file = v->GetFile(0);
-                        AddChoice(l->otherVoices, v->GetFormID(), std::format("{} [{}]", VoiceName(v), file ? file->GetFilename() : "?"sv));
+                        AddChoice(l->otherVoices, v->GetFormID(), VoiceLabel(v, VoiceName(v)));  // (133) [plugin] only for mods
                     }
                 }
                 std::sort(l->otherVoices.begin(), l->otherVoices.end(), [](const Choice& a, const Choice& b) { return a.name < b.name; });
@@ -1976,6 +2326,9 @@ namespace LF
                     auto file = npc ? npc->GetFile(0) : nullptr;
                     if (v && npc->IsUnique() && !(file && file->GetFilename() == kPlugin) && !l->ownedVoices.contains(v->GetFormID()) && Voice::IsFollowerVoice(v)) {
                         l->ownedVoices.insert(v->GetFormID());
+                        if (!PluginFollowerScript(file).empty()) {
+                            l->ownSystemVoices.insert(v->GetFormID());  // (136) its NPC's mod has its own follower system
+                        }
                     }
                 }
                 // NG (user): also voices a unique NPC has in its plugin file but not in the game (another mod changed it,
@@ -1995,8 +2348,7 @@ namespace LF
                         auto v = Lookup<RE::BGSVoiceType>(it->id);
                         const bool inEsp = v && std::find(espList.begin(), espList.end(), v) != espList.end();
                         if (v && !inEsp && l->ownedVoices.contains(it->id)) {
-                            auto file = v->GetFile(0);
-                            AddChoice(l->otherVoices, v->GetFormID(), std::format("{} [{}]", VoiceName(v), file ? file->GetFilename() : "?"sv));
+                            AddChoice(l->otherVoices, v->GetFormID(), VoiceLabel(v, VoiceName(v)));  // (133) [plugin] only for mods
                             it = list->erase(it);
                             moved = true;
                         } else {
@@ -2119,7 +2471,7 @@ namespace LF
             // Fix (user GIF): sorted by the voice's own Female flag, not the NPC's sex (Lazy Followers' slots
             // change sex, so a male voice landed in Female Voice); children's voices and our own followers'
             // voices are not added (they stay in Other Voice)
-            if (v && !a_actor->IsChild() && SlotOfActor(a_actor) < 0) {
+            if (v && !a_actor->IsChild() && SlotOfActor(a_actor) < 0 && !Voice::IsModded(v)) {  // (132) modded: Other Voice
                 const bool female = v->data.flags.all(RE::VOICE_TYPE_DATA::Flag::kFemale);
                 auto&      list = female ? g_extraFemaleVoices : g_extraMaleVoices;
                 auto       esp = ListForms(female ? g_femaleVoicesList : g_maleVoicesList);
@@ -2227,6 +2579,7 @@ namespace LF
         constexpr std::uint32_t kRecPreSummon = 'PSUM';  // NG (user): ref of a slot with Pre Summon ticked
         constexpr std::uint32_t kRecErin = 'ERIN';       // NG (user): ref + Erin Preset file of an active slot
         constexpr std::uint32_t kRecRealText = 'RTXT';  // NG: a real NPC's own reference name data (after its REAL)
+        constexpr std::uint32_t kRecOwnGear = 'OWNG';  // NG: ref + a real NPC's own gear taken off at the take-over (after its REAL)
         constexpr std::uint32_t kRecReal = 'REAL';   // NG 1.2: a real NPC entry: ref, base, its own name / race / sex (before SLOT...)
         constexpr std::uint32_t kVersion = 2;     // 2 = written with the ESL-flagged esp; 1 = old esp IDs (mapped on load)
         std::uint32_t           g_loadVersion = kVersion;  // version of the co-save record being read
@@ -2319,6 +2672,18 @@ namespace LF
                     WriteForm(a_intfc, s.textQuest);
                     a_intfc->WriteRecordData(s.textInstance);
                     a_intfc->WriteRecordData(s.textTemper);
+                }
+                if (s.real && s.ref && !s.ownGear.empty() && a_intfc->OpenRecord(kRecOwnGear, kVersion)) {
+                    WriteForm(a_intfc, s.ref);
+                    a_intfc->WriteRecordData(static_cast<std::uint32_t>(s.ownGear.size()));
+                    for (auto& [id, count] : s.ownGear) {
+                        WriteForm(a_intfc, id);
+                        a_intfc->WriteRecordData(count);
+                    }
+                    a_intfc->WriteRecordData(static_cast<std::uint32_t>(s.ownWorn.size()));
+                    for (auto id : s.ownWorn) {
+                        WriteForm(a_intfc, id);
+                    }
                 }
             }
             for (std::size_t i = 0; i < g_slots.size(); ++i) {
@@ -2430,6 +2795,8 @@ namespace LF
                 j["AutoEquip"] = g_autoEquip;
                 j["IncludeEquipment"] = g_includeEquip;
                 j["CustomSpells"] = g_spellsEnabled;
+                j["FullInventoryPlayer"] = g_fullInvPlayer.load();
+                j["FullInventoryNPC"] = g_fullInvNpc.load();
                 j["ScanRadius"] = g_scanRadius;
                 j["NearbyRows"] = g_nearbyRows;
                 j["NearbyWidths"] = g_nearbyWidths;
@@ -2442,6 +2809,8 @@ namespace LF
             j["SummonKey"] = { { "VirtualKey", summon.vk }, { "Mods", summon.mods } };
             const auto summonAll = SummonAllKey();
             j["SummonAllKey"] = { { "VirtualKey", summonAll.vk }, { "Mods", summonAll.mods } };
+            const auto store = StoreKey();
+            j["StoreKey"] = { { "VirtualKey", store.vk }, { "Mods", store.mods } };
             const auto savePreset = SavePresetKey();
             j["SavePresetKey"] = { { "VirtualKey", savePreset.vk }, { "Mods", savePreset.mods } };
             const auto openInv = OpenInventoryKey();
@@ -2454,7 +2823,7 @@ namespace LF
         // The settings that need no game: Open Window hotkey and the Nearby Actors column widths.
         void LoadUiSettings(const nlohmann::json& a_j)
         {
-            for (auto [name, store] : { std::pair{ "OpenWindowKey", &g_openKey }, std::pair{ "SummonKey", &g_summonKey }, std::pair{ "SummonAllKey", &g_summonAllKey },
+            for (auto [name, store] : { std::pair{ "OpenWindowKey", &g_openKey }, std::pair{ "SummonKey", &g_summonKey }, std::pair{ "SummonAllKey", &g_summonAllKey }, std::pair{ "StoreKey", &g_storeKey },
                                          std::pair{ "SavePresetKey", &g_savePresetKey }, std::pair{ "OpenInventoryKey", &g_openInvKey },
                                          std::pair{ "NearbyWindowKey", &g_nearbyWinKey } }) {
                 if (auto v = Files::Find(a_j, name); v && v->is_object()) {
@@ -2511,6 +2880,13 @@ namespace LF
             flag("AutoEquip", g_autoEquip);
             flag("IncludeEquipment", g_includeEquip);
             flag("CustomSpells", g_spellsEnabled);
+            {
+                bool player = g_fullInvPlayer.load(), npc = g_fullInvNpc.load();
+                flag("FullInventoryPlayer", player);
+                flag("FullInventoryNPC", npc);
+                g_fullInvPlayer = player;
+                g_fullInvNpc = npc;
+            }
             if (auto v = Files::Find(*j, "ScanRadius"); v && v->is_number()) {
                 g_scanRadius = std::clamp(v->get<float>(), 1.0f, 100.0f);
             }
@@ -2628,6 +3004,31 @@ namespace LF
                         it->textQuest = quest;
                         it->textInstance = instance;
                         it->textTemper = temper;
+                    }
+                } else if (type == kRecOwnGear) {
+                    const auto                                       ref = ReadForm(a_intfc);
+                    std::vector<std::pair<RE::FormID, std::int32_t>> gear;
+                    std::vector<RE::FormID>                          worn;
+                    std::uint32_t                                    n = 0;
+                    a_intfc->ReadRecordData(n);
+                    for (std::uint32_t k = 0; k < n && k < 1000; ++k) {
+                        const auto   id = ReadForm(a_intfc);
+                        std::int32_t count = 0;
+                        a_intfc->ReadRecordData(count);
+                        if (id && count > 0) {
+                            gear.emplace_back(id, count);
+                        }
+                    }
+                    a_intfc->ReadRecordData(n);
+                    for (std::uint32_t k = 0; k < n && k < 1000; ++k) {
+                        if (const auto id = ReadForm(a_intfc)) {
+                            worn.push_back(id);
+                        }
+                    }
+                    auto it = std::find_if(g_slots.begin(), g_slots.end(), [&](const Slot& s) { return s.real && s.ref && s.ref == ref; });
+                    if (it != g_slots.end()) {
+                        it->ownGear = std::move(gear);
+                        it->ownWorn = std::move(worn);
                     }
                 } else if (type == kRecSlot) {
                     const auto ref = ReadForm(a_intfc);
@@ -3394,6 +3795,10 @@ namespace LF
             WaitForLoad(i, kLoadWaitTries);
         }
         AutoScanSoon();  // NG (user): Nearby Actors list for this save
+        g_wwmRegistered.clear();  // NG: Walk With Me forgets API registrations at a load - made again by WwmLoop
+        g_wwmLastState.clear();
+        g_pluginFollowerScripts.clear();  // (136) scanned again for this game
+        After(3.0f, []() { WwmLoop(); });
     }
 
     void OnLeaveGame()
@@ -3673,6 +4078,22 @@ namespace LF
         SaveSettings();
     }
 
+    bool FullInventoryPlayer() { return g_fullInvPlayer.load(); }
+
+    void SetFullInventoryPlayer(bool a_on)
+    {
+        g_fullInvPlayer = a_on;
+        SaveSettings();
+    }
+
+    bool FullInventoryNPC() { return g_fullInvNpc.load(); }
+
+    void SetFullInventoryNPC(bool a_on)
+    {
+        g_fullInvNpc = a_on;
+        SaveSettings();
+    }
+
     float ScanRadius()
     {
         std::lock_guard lock(g_lock);
@@ -3703,6 +4124,8 @@ namespace LF
             g_spellsEnabled = true;
             g_autoEquip = false;
             g_includeEquip = true;
+            g_fullInvPlayer = true;
+            g_fullInvNpc = true;
             g_scanRadius = kDefaultScanRadius;
             g_nearbyRows = kDefaultNearbyRows;
             g_presetRows = kDefaultNearbyRows;
@@ -3757,6 +4180,18 @@ namespace LF
     void SetSummonAllKey(KeyBinding a_key)
     {
         g_summonAllKey = static_cast<std::uint64_t>(a_key.vk) | (static_cast<std::uint64_t>(a_key.mods) << 32);
+        SaveSettings();
+    }
+
+    KeyBinding StoreKey()
+    {
+        const auto v = g_storeKey.load();
+        return { static_cast<std::uint32_t>(v & 0xFFFFFFFF), static_cast<std::uint32_t>(v >> 32) };
+    }
+
+    void SetStoreKey(KeyBinding a_key)
+    {
+        g_storeKey = static_cast<std::uint64_t>(a_key.vk) | (static_cast<std::uint64_t>(a_key.mods) << 32);
         SaveSettings();
     }
 
@@ -3921,16 +4356,30 @@ namespace LF
         // armor / weapons / ammo (quest items stay), then gets everything the slot follower carried and wears what
         // it wore. Its default outfit is off meanwhile (ApplyRealSkin), so the game does not dress it again;
         // Remove puts the outfit back on.
-        void TransferGear(RE::Actor* a_from, RE::Actor* a_to)
+        // NG: returns what a_to dropped (form + count) and which of those it wore - a real NPC keeps them in its entry
+        // (Slot::ownGear) and gets them back on give-back (user: Sofia naked after a give-back).
+        struct DroppedGear
         {
+            std::vector<std::pair<RE::FormID, std::int32_t>> items;
+            std::vector<RE::FormID>                          worn;
+        };
+
+        DroppedGear TransferGear(RE::Actor* a_from, RE::Actor* a_to)
+        {
+            DroppedGear out;
             if (!a_from || !a_to) {
-                return;
+                return out;
             }
             auto                                                  worn = WornGear(a_from);
+            const auto                                            ownWorn = WornGear(a_to);
             std::vector<std::pair<RE::TESBoundObject*, std::int32_t>> drop;
             for (auto& [obj, data] : a_to->GetInventory()) {
                 if (obj && data.first > 0 && (obj->IsArmor() || obj->IsWeapon() || obj->IsAmmo()) && !(data.second && data.second->IsQuestObject())) {
                     drop.emplace_back(obj, data.first);
+                    out.items.emplace_back(obj->GetFormID(), data.first);
+                    if (std::find(ownWorn.begin(), ownWorn.end(), obj) != ownWorn.end()) {
+                        out.worn.push_back(obj->GetFormID());
+                    }
                 }
             }
             auto chain = Papyrus::Chain::Make();
@@ -3940,7 +4389,13 @@ namespace LF
                     for (auto& [obj, count] : drop) {
                         a_to->RemoveItem(obj, count, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
                     }
-                    Out(std::format("{} - {} own armor / weapon items dropped", DisplayName(a_to), drop.size()));
+                    std::string names;  // (129b) which ones, for the log
+                    for (auto& [obj, count] : drop) {
+                        const char* n = obj->GetName();
+                        names += std::format("{}{} {:08X} x{}", names.empty() ? "" : ", ", n && *n ? n : "?", obj->GetFormID(), count);
+                    }
+                    Out(std::format("{} - {} own armor / weapon items taken off and kept for its give-back: {}", DisplayName(a_to), drop.size(),
+                        names.empty() ? "none" : names));
                     d(Papyrus::Variable{});
                 });
                 return true;
@@ -3955,6 +4410,19 @@ namespace LF
                 Out(std::format("{} got {}'s items ({} worn)", to, from, n));
             });
             chain->Run();
+            return out;
+        }
+
+        // NG: a real NPC entry keeps the own gear its NPC dropped at the take-over (only the first time - a take-over
+        // again before a give-back would drop the follower's gear, not its own).
+        void KeepOwnGear(int a_real, DroppedGear a_own)
+        {
+            std::lock_guard lock(g_lock);
+            auto&           s = g_slots[a_real];
+            if (s.ownGear.empty()) {
+                s.ownGear = std::move(a_own.items);
+                s.ownWorn = std::move(a_own.worn);
+            }
         }
 
         // NG 1.2: a real NPC (e.g. Sofia) as a real NPC entry: its entry if it has one, else a free entry filled
@@ -4180,7 +4648,8 @@ namespace LF
                     }
                     slotName = DisplayName(ActorOf(a_slot));
                     Out(std::format("{} takes over {} (voice {:08X}); the slot goes back to storage", DisplayName(owner), slotName, req.voice));
-                    TransferGear(ActorOf(a_slot), owner);  // before StoreSlot's reset (worn list)
+                    auto own = TransferGear(ActorOf(a_slot), owner);  // before StoreSlot's reset (worn list)
+                    KeepOwnGear(r, std::move(own));
                     StoreSlot(a_slot);
                     a_slot = r;
                     takeOver = true;
@@ -4231,8 +4700,9 @@ namespace LF
                     }
                     slotName = DefaultName(a_slot);  // its own name (e.g. Cubbi), for the notice
                     Out(std::format("{} is given back; {} takes over (voice {:08X})", slotName, DisplayName(owner), req.voice));
-                    TransferGear(old, owner);  // before the reset (worn list)
-                    ResetSlot(a_slot);         // give back: own look, name, voice, outfit, sent home
+                    auto own = TransferGear(old, owner);  // before the reset (worn list)
+                    ResetSlot(a_slot);         // give back: own look, name, voice, outfit, own gear, sent home
+                    KeepOwnGear(r, std::move(own));
                     {
                         std::lock_guard lock(g_lock);
                         g_slots[a_slot] = Slot{};
@@ -4327,9 +4797,19 @@ namespace LF
             if (erinChanged) {
                 ResetErin(actor, oldErin);  // NG: the old Erin preset's tints / skin / head-part positions / face shape off (another one or none now - e.g. not an Erin race any more)
             }
-            // NG: the slot takes the preset's sex (from its head parts); unknown = the slot's current one
-            const int sex = Files::PresetSex(req.presetFile);
-            bool      female = false;
+            // NG: the slot takes the preset's sex (from its head parts). (131, user: a female preset sometimes came out
+            // male) unknown (a tie / unisex parts) = the picked voice's sex (its Female flag), only without a voice the
+            // slot's current one - a male slot used to stay male.
+            int sex = Files::PresetSex(req.presetFile);
+            bool fromVoice = false;
+            if (sex < 0) {
+                if (auto v = Lookup<RE::BGSVoiceType>(req.voice)) {
+                    sex = v->data.flags.all(RE::VOICE_TYPE_DATA::Flag::kFemale) ? 1 : 0;
+                    fromVoice = true;
+                    Out(std::format("{}: sex not clear from its head parts - {} like its voice {:08X}", req.presetFile, sex == 1 ? "female" : "male", req.voice));
+                }
+            }
+            bool female = false;
             {
                 std::lock_guard lock(g_lock);
                 auto&           s = g_slots[a_slot];
@@ -4390,17 +4870,19 @@ namespace LF
                 return;
             }
             if (switched) {
-                SetNotice(std::format("{} was given back; {} (own voice and dialogue) is now {} with {}.", slotName, DefaultName(a_slot), DisplayName(actor),
-                    req.presetFile));
+                SetNotice(std::format("{} was given back; {} (own voice and dialogue) is now {} with {}.{}", slotName, DefaultName(a_slot), DisplayName(actor),
+                    req.presetFile, OwnFollowerWarning(actor, DefaultName(a_slot))));
                 return;
             }
             if (takeOver) {
-                SetNotice(std::format("{} (own voice and dialogue) is now {} with {} ({}); {} went back to storage.", DefaultName(a_slot), DisplayName(actor),
-                    req.presetFile, female ? "female" : "male", slotName));
+                SetNotice(std::format("{} (own voice and dialogue) is now {} with {} ({}); {} went back to storage.{}", DefaultName(a_slot), DisplayName(actor),
+                    req.presetFile, female ? "female" : "male", slotName, OwnFollowerWarning(actor, DefaultName(a_slot))));
                 return;
             }
-            SetNotice(std::format("Applied {} to {} ({}{}).", req.presetFile, req.name.empty() ? DisplayName(actor) : req.name, female ? "female" : "male",
-                sex < 0 ? ", sex not found in the preset - kept" : ""));
+            // NG (user, 137): no result line for a plain apply any more - the page shows a green "Applied"; the log keeps it
+            Out(std::format("Applied {} to {} ({}{}).", req.presetFile, req.name.empty() ? DisplayName(actor) : req.name, female ? "female" : "male",
+                sex < 0 ? ", sex not found in the preset - kept" : fromVoice ? ", sex not clear in the preset - taken from the voice" : ""));
+            SetNotice({});
         });
     }
 
@@ -4590,6 +5072,10 @@ namespace LF
             if (!a_ctx || !a_ctx->target || !g_invShowAll.load() || a_ctx->target->GetFormID() != g_invActor.load()) {
                 return g_filter(a_ctx, a_entry);
             }
+            // NG (user): Settings > Full Inventory NPC (the NPC's list) / Full Inventory Player (your list) - off = vanilla
+            if (!(a_ctx->containerSide ? g_fullInvNpc.load() : g_fullInvPlayer.load())) {
+                return g_filter(a_ctx, a_entry);
+            }
             ContainerFilter ctx = *a_ctx;
             ctx.mode = 0;  // the filter only reads it: not 3 = no outfit subtraction, not 2 = no steal checks
             if (g_filter(&ctx, a_entry)) {
@@ -4603,7 +5089,7 @@ namespace LF
         // every item is shown, however the inventory was opened.
         bool InventoryItemTestHook(RE::InventoryEntryData* a_entry)
         {
-            return g_itemTest(a_entry) || ShowAnyway(a_entry);
+            return g_itemTest(a_entry) || (g_fullInvPlayer.load() && ShowAnyway(a_entry));  // NG (user): Settings > Full Inventory Player
         }
 
         // True when a_at holds "call a_target" (rel32) - nobody else patched it.
@@ -4692,6 +5178,79 @@ namespace LF
             Out(text);
             RE::DebugNotification(text.c_str());
             SummonTo(actor, RE::PlayerCharacter::GetSingleton());
+        });
+    }
+
+    // NG (user: "put my follower back into storage, but not delete them"): unlike Remove (reset + storage) the slot
+    // keeps everything - preset, name, voice, race, stats, spells, gear, Keep boxes. It is dismissed first (the
+    // follower quest it is in: Skyrim's DialogueFollower / NFF, through its own DismissFollower - AddOwnDismiss),
+    // then moved to the storage cell and disabled. Summon NPC / Apply Settings bring it back (they enable it).
+    // Slot followers only - a taken-over real NPC lives in the world (Remove gives it back).
+    void Store(int a_slot)
+    {
+        OnMain([a_slot]() {
+            auto actor = ActorOf(a_slot);
+            if (!actor || !InGame()) {
+                return;
+            }
+            const auto name = DisplayName(actor);
+            if (IsReal(a_slot)) {
+                // NG (user: "send her home but keep the button as Storage"): a taken-over NPC lives in the world (its own
+                // quests / scenes) - no storage cell: dismissed in its own mod, sent to its own place, look / name /
+                // gear kept (unlike Remove). Summon NPC brings it back.
+                WwmUnregister(actor->GetFormID());
+                auto chain = Papyrus::Chain::Make();
+                AddOwnDismiss(*chain, actor);
+                chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "MoveToMyEditorLocation", d); });
+                chain->ThenDo([name]() { Out(std::format("{} sent home (taken over - look and settings kept)", name)); });
+                chain->Run();
+                SetNotice(std::format("{} went home - everything kept (still taken over). Summon NPC brings it back.", name));
+                return;
+            }
+            if (actor->IsDisabled()) {
+                SetNotice(std::format("{} is already in storage.", name));
+                return;
+            }
+            auto chain = Papyrus::Chain::Make();
+            AddOwnDismiss(*chain, actor);  // stops following first (else a follow catch-up could bring it back)
+            if (g_marker) {
+                chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "MoveTo", d, g_marker, 0.0f, 0.0f, 0.0f, true); });
+            }
+            chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "Disable", d, false); });
+            chain->ThenDo([name]() { Out(std::format("{} sent to storage (settings kept)", name)); });
+            chain->Run();
+            SetNotice(std::format("{} went to storage - everything kept. Summon NPC brings it back.", name));
+        });
+    }
+
+    void StoreSelected()
+    {
+        OnMain([]() {
+            if (!InGame()) {
+                return;
+            }
+            int slot = -1;
+            if (auto ref = g_crosshair.get(); ref) {  // the slot follower you look at right now
+                if (auto a = ref->As<RE::Actor>()) {
+                    if (const int s = SlotOfActor(a); s >= 0) {
+                        slot = s;  // (134b) a taken-over NPC too: it is sent home (Store)
+                    }
+                }
+            }
+            if (slot < 0) {
+                std::lock_guard lock(g_lock);
+                const int sel = g_snapSelected.load();
+                if (sel >= 0 && sel < static_cast<int>(g_slots.size()) && g_slots[sel].Active()) {
+                    slot = sel;
+                }
+            }
+            auto actor = slot >= 0 ? ActorOf(slot) : nullptr;
+            if (!actor) {
+                RE::DebugNotification("Lazy Followers: look at a follower (or select one on the Followers page) to store it");
+                return;
+            }
+            RE::DebugNotification(std::format("{} goes {}", DisplayName(actor), IsReal(slot) ? "home" : "to storage").c_str());
+            Store(slot);
         });
     }
 

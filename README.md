@@ -3,7 +3,7 @@
 An SKSE plugin that replaces [Lazy Followers](https://www.nexusmods.com/skyrimspecialedition/mods/43312) 0.42.3 by [LazyGirl](https://www.nexusmods.com/profile/LazyGirl?gameId=1704): its Papyrus scripts and MCM are now C++ and **SKSE Menu Framework** pages.
 It uses its own modified copy of `LazyFollowers.esp` and the same files and folders as the original mod, so presets, NPC files and the config carry over.
 
-Version 1.4.1. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
+Version 1.5.0. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
 
 ## Requirements
 
@@ -31,10 +31,12 @@ No longer needed: SkyUI / MCM, JContainers, PapyrusUtil, powerofthree's Papyrus 
 - **Followers**
   - The Follower list shows only followers in use: name and base form ID, searchable. Add Follower takes the next free slot.
   - Distance and location of the selected follower.
-  - Appearance: name, preset, race and Female / Male / Other Voice, all searchable drop-downs. Races from mods show their plugin, e.g. "Nord UBE [UBE_AllRace.esp]". Picking a preset switches Race to the race it was made for. Apply Settings applies the preset, then brings the follower to you (not when it is already next to you).
+  - Appearance: name, preset, race and Female / Male / Other Voice, all searchable drop-downs. Races and voices from mods show their plugin, e.g. "Nord UBE [UBE_AllRace.esp]"; base-game ones have no tag. Female / Male Voice list the original mod's voices, every other voice is under Other Voice. Picking a preset switches Race to the race it was made for. Apply Settings applies the preset, then brings the follower to you (not when it is already next to you). A green "Applied" shows next to Apply Settings while the choices match what the follower has, and on the follower's current entry in every drop-down (search "Applied" to find it).
+  - The follower's sex follows the preset; when the preset doesn't say, the picked voice decides.
   - Erin Preset (with the Erin race installed, only for Erin-race followers): loads an Erin race extra preset (extra tints, eye colour set, skin, head-part adjust) on the follower.
   - Keep in New Game (with Pre Summon): the follower comes back in a new game once RaceMenu closes.
-  - NPC Preset, Actions (Summon, Teleport, Remove, Copy Kit with Auto Equip and Include Equipment), Apply to All / Summon All, Combat Style and Class.
+  - NPC Preset, Actions (Summon, Teleport, Storage, Remove, Copy Kit with Auto Equip and Include Equipment), Apply to All / Summon All, Combat Style and Class.
+  - Storage: sends a follower to storage without losing anything (preset, name, voice, stats, spells, gear); Summon brings her back as she was. A taken-over NPC is sent home instead and stays taken over.
 - **Stats**: stats and skills, each with Reset (back to the value before you changed it) and Reset All.
 - **Spells**: a folder per magic school with search, and a list of added spells (right-click removes one).
 - **Combat Styles**: the 10 Lazy Followers combat styles with all their values, and a Follower section that opens that follower's style.
@@ -42,7 +44,7 @@ No longer needed: SkyUI / MCM, JContainers, PapyrusUtil, powerofthree's Papyrus 
   - Nearby Actors with Save Actor Preset: saves any nearby actor's RaceMenu look and face tint, no console needed. The actor selected in the console, or else the actor you look at, is ticked by itself.
   - RaceMenu Mode, behaviour options, Config / NPC data files, logging.
   - Presets: one table of all RaceMenu presets (search, tick any number). Right-click: Hide (its .jslot, .dds and .nif are renamed to .hidden, nothing deleted), Unhide, Delete. Hidden ones are greyed out.
-  - Hotkeys (each with Clear and Reset; one key per hotkey): open the pages as tabs in a window of their own; summon the selected follower; summon all followers; save your own look as a preset (asks a name, like `skee preset-save`); open the inventory of the ticked actor (an NPC's as a trade window, your own as normal; the hotkey again closes it); open Nearby Actors in a window of its own.
+  - Hotkeys (each with Clear and Reset; one key per hotkey): open the pages as tabs in a window of their own; summon the selected follower; summon all followers; save your own look as a preset (asks a name, like `skee preset-save`); open the inventory of the ticked actor (an NPC's as a trade window, your own as normal; the hotkey again closes it); open Nearby Actors in a window of its own; send the follower you look at to Storage.
 
 Stats, Combat Styles and Settings have a search box at the top.
 
@@ -50,13 +52,15 @@ Stats, Combat Styles and Settings have a search box at the top.
 
 - Open Inventory (hotkey) on an NPC lists everything it carries, also items the game hides: non-playable items (skins, body / physics add-ons, mod items) and its outfit pieces. Your side of that trade window lists everything too. Chests, looting, pickpocketing and trading through dialogue stay as in the game.
 - Your own inventory (Tab / I, or Open Inventory on yourself) always lists every item, non-playable ones included.
+- Settings > Inventory: Full Inventory Player and Full Inventory NPC turn either part off (back to the game's normal lists).
 - Taking a follower's outfit pieces makes the game put her outfit back on her.
 
 **Modded follower voices**
 
 - A follower given the voice type of a voiced-follower mod (for example Sofia or Severa) says that mod's own lines: greetings, Follow / Wait / Trade / Part ways answers and its "Can I talk to you?" topics. Lines the mod has no recording for are silenced.
-- Override: with that voice picked, the mod's real NPC can take the follower's place. She gets the follower's preset, race and name, and keeps her own voice, quests and dialogue. Stats, spells, combat style and class can be set on her like on a slot follower. Remove gives back her own look, name, outfit, style and class and sends her back to her own place. Override can move from one follower to another. Picking a voice that is not hers (e.g. EvenToned) hides the Override box; Apply Settings then gives her back and a normal follower slot takes the preset with that voice.
+- Override: with that voice picked, the mod's real NPC can take the follower's place. She gets the follower's preset, race and name, and keeps her own voice, quests and dialogue. Stats, spells, combat style and class can be set on her like on a slot follower. Remove gives back her own look, name, outfit, style, class and her own armor / weapons, dismisses her in her own mod (so her mod's catch-up doesn't bring her back) and sends her back to her own place. Override can move from one follower to another. Picking a voice that is not hers (e.g. EvenToned) hides the Override box; Apply Settings then gives her back and a normal follower slot takes the preset with that voice.
 - Override also works with a base-game voice that belongs to one single NPC, such as Serana's (`DLC1SeranaVoice`): the real Serana becomes the follower with all her own dialogue. She is part of the Dawnguard questline, so taking her over while a quest still needs her can clash with it.
+- An NPC with her own follower system (e.g. Sofia) is recruited, told to wait and dismissed with her own dialogue; follower frameworks like NFF don't list her, and the Followers page says so. With Walk With Me installed she is registered with it while she follows you, so its Party page lists her.
 - When a follower gets two talk options with the same text from different mods (e.g. "Follow me. I need your help." from the game and from Relationship Dialogue Overhaul), the one from the mod gets the mod's short name: "Follow me. I need your help. (RDO)".
 
 **Changes from the original mod**

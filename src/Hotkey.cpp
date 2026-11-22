@@ -1,10 +1,11 @@
-// Hotkey - the Settings page's hotkeys (NG 1.1, user): "Open Window", "Summon Follower", "Summon All", "Save Player Preset",
+// Hotkey - the Settings page's hotkeys (NG 1.1, user): "Open Window", "Summon Follower", "Summon All", "Storage", "Save Player Preset",
 // "Open Inventory", "Nearby Actors Window". Like Actor
 // Control: the keyboard is read straight from Windows (GetAsyncKeyState) on its own thread ~100 times a
 // second, so it works over any menu; a key is stored as a Windows virtual key + Ctrl / Shift / Alt. Open
 // Window opens / closes the Lazy Followers window (Menu::ToggleWindow, run as a UI task); Summon Follower
 // summons the follower selected in the pages (LF::SummonSelected), Summon All every follower not following
-// (LF::SummonAll), Save Player Preset opens the name dialog (Menu::OpenSavePresetDialog), Open Inventory the inventory of the
+// (LF::SummonAll), Storage sends the slot follower you look at (else the selected one) to storage, settings kept
+// (LF::StoreSelected), Save Player Preset opens the name dialog (Menu::OpenSavePresetDialog), Open Inventory the inventory of the
 // actor ticked in Settings > Nearby Actors (Menu::OpenPickedInventory), Nearby Actors Window opens / closes that window
 // (Menu::ToggleNearbyWindow). One key per hotkey: binding a key takes it away from any other hotkey. Binding: a Settings key button starts a
 // capture; the next key pressed (with the Ctrl / Shift / Alt held then) is bound, Esc cancels.
@@ -95,6 +96,7 @@ namespace Hotkey
             { Key::kOpenWindow, "Open Window", LF::OpenWindowKey, LF::SetOpenWindowKey },
             { Key::kSummon, "Summon Follower", LF::SummonKey, LF::SetSummonKey },
             { Key::kSummonAll, "Summon All", LF::SummonAllKey, LF::SetSummonAllKey },
+            { Key::kStore, "Storage", LF::StoreKey, LF::SetStoreKey },
             { Key::kSavePreset, "Save Player Preset", LF::SavePresetKey, LF::SetSavePresetKey },
             { Key::kOpenInventory, "Open Inventory", LF::OpenInventoryKey, LF::SetOpenInventoryKey },
             { Key::kNearbyWindow, "Nearby Actors Window", LF::NearbyWindowKey, LF::SetNearbyWindowKey },
@@ -131,6 +133,7 @@ namespace Hotkey
             const auto            open = LF::OpenWindowKey();
             const auto            summon = LF::SummonKey();
             const auto            summonAll = LF::SummonAllKey();
+            const auto            store = LF::StoreKey();
             const auto            savePreset = LF::SavePresetKey();
             const auto            openInv = LF::OpenInventoryKey();
             const auto            nearbyWin = LF::NearbyWindowKey();
@@ -140,14 +143,14 @@ namespace Hotkey
                     now[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
                 }
             } else {
-                if (!Usable(open) && !Usable(summon) && !Usable(summonAll) && !Usable(savePreset) && !Usable(openInv) && !Usable(nearbyWin)) {
+                if (!Usable(open) && !Usable(summon) && !Usable(summonAll) && !Usable(store) && !Usable(savePreset) && !Usable(openInv) && !Usable(nearbyWin)) {
                     g_prev.fill(false);
                     return;
                 }
                 for (int vk : { VK_CONTROL, VK_SHIFT, VK_MENU }) {
                     now[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
                 }
-                for (const auto& b : { open, summon, summonAll, savePreset, openInv, nearbyWin }) {
+                for (const auto& b : { open, summon, summonAll, store, savePreset, openInv, nearbyWin }) {
                     if (Usable(b)) {
                         now[b.vk] = (GetAsyncKeyState(static_cast<int>(b.vk)) & 0x8000) != 0;
                     }
@@ -192,11 +195,12 @@ namespace Hotkey
             const bool openPressed = pressed(open);
             const bool summonPressed = pressed(summon);
             const bool summonAllPressed = pressed(summonAll);
+            const bool storePressed = pressed(store);
             const bool savePresetPressed = pressed(savePreset);
             const bool openInvPressed = pressed(openInv);
             const bool nearbyWinPressed = pressed(nearbyWin);
             g_prev = now;
-            if ((openPressed || summonPressed || summonAllPressed || savePresetPressed || openInvPressed || nearbyWinPressed) && Allowed()) {
+            if ((openPressed || summonPressed || summonAllPressed || storePressed || savePresetPressed || openInvPressed || nearbyWinPressed) && Allowed()) {
                 if (openPressed) {
                     SKSE::GetTaskInterface()->AddUITask([]() { Menu::ToggleWindow(); });
                 }
@@ -205,6 +209,9 @@ namespace Hotkey
                 }
                 if (summonAllPressed) {
                     LF::SummonAll(true);
+                }
+                if (storePressed) {
+                    LF::StoreSelected();
                 }
                 if (savePresetPressed) {
                     SKSE::GetTaskInterface()->AddUITask([]() { Menu::OpenSavePresetDialog(); });
@@ -234,8 +241,8 @@ namespace Hotkey
                 }
             }
         }).detach();
-        logger::info("Hotkey reader started (Open Window: {}, Summon Follower: {}, Summon All: {}, Save Player Preset: {}, Open Inventory: {}, Nearby Actors Window: {})",
-            Name(LF::OpenWindowKey()), Name(LF::SummonKey()), Name(LF::SummonAllKey()), Name(LF::SavePresetKey()), Name(LF::OpenInventoryKey()),
+        logger::info("Hotkey reader started (Open Window: {}, Summon Follower: {}, Summon All: {}, Storage: {}, Save Player Preset: {}, Open Inventory: {}, Nearby Actors Window: {})",
+            Name(LF::OpenWindowKey()), Name(LF::SummonKey()), Name(LF::SummonAllKey()), Name(LF::StoreKey()), Name(LF::SavePresetKey()), Name(LF::OpenInventoryKey()),
             Name(LF::NearbyWindowKey()));
     }
 
