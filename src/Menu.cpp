@@ -464,6 +464,16 @@ namespace Menu
         {
             bool        error = false;
             std::string text = LF::Notice(error);
+            // NG (user video 21-27-46: it stayed forever): a result line shows for 10 s after it appeared
+            static unsigned                              shown = ~0u;
+            static std::chrono::steady_clock::time_point since;
+            if (const auto serial = LF::NoticeSerial(); serial != shown) {  // a new result (also the same text again)
+                shown = serial;
+                since = std::chrono::steady_clock::now();
+            }
+            if (!text.empty() && std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+                text.clear();
+            }
             if (!text.empty()) {
                 TextColored(error ? kErrorRed : kValueBlue, "%s", text.c_str());
             } else if (a_keepRoom) {
@@ -778,6 +788,9 @@ namespace Menu
                 if (const int p = SearchCombo("##v", preview.c_str(), static_cast<int>(listed.size()), cur,
                         [&](int k) -> std::string_view { return names[k]; });
                     p >= 0) {
+                    if (listed[p] != g_selected) {
+                        LF::SetNotice({});  // NG (user video 21-27-46): the last result belongs to the old follower
+                    }
                     g_selected = listed[p];
                 }
             }
@@ -982,6 +995,7 @@ namespace Menu
                     LF::SetPreSummon(g_selected, v);
                 }
             }
+            // NG (user, video 2026-11-21 21-27-46): back, but cleared when another follower is picked and gone after 10 s
             DrawNotice(true);
 
             Section("Appearance", "Pick name, preset, race and voice, then Apply Settings (the MCM's \"Apply settings\").\n"

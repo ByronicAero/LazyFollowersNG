@@ -184,6 +184,7 @@ namespace LF
 
         std::mutex  g_noticeLock;
         std::string g_notice;
+        std::atomic<unsigned> g_noticeSerial{ 0 };  // NG: bumped by every SetNotice
         bool        g_noticeError = false;
 
         // ---- small helpers ----
@@ -3981,6 +3982,8 @@ namespace LF
         OnMain([]() { BuildLists(); });
     }
 
+    unsigned NoticeSerial() { return g_noticeSerial.load(); }
+
     std::string Notice(bool& a_error)
     {
         std::lock_guard lock(g_noticeLock);
@@ -4002,6 +4005,7 @@ namespace LF
         std::lock_guard lock(g_noticeLock);
         g_notice = std::move(a_text);
         g_noticeError = a_error;
+        ++g_noticeSerial;
     }
 
     // ==================================================================

@@ -3,7 +3,7 @@
 An SKSE plugin that replaces [Lazy Followers](https://www.nexusmods.com/skyrimspecialedition/mods/43312) 0.42.3 by [LazyGirl](https://www.nexusmods.com/profile/LazyGirl?gameId=1704): its Papyrus scripts and MCM are now C++ and **SKSE Menu Framework** pages.
 It uses its own modified copy of `LazyFollowers.esp` and the same files and folders as the original mod, so presets, NPC files and the config carry over.
 
-Version 1.5.0. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
+Version 1.5.1. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
 
 ## Requirements
 

@@ -173,6 +173,7 @@ namespace LF
     bool Nickname(RE::FormID a_ref, std::string& a_from, std::string& a_to);
     void                     RebuildLists();
     std::string              Notice(bool& a_error);
+    unsigned                 NoticeSerial();  // NG: counts every SetNotice (the page restarts its 10 s on a new one, even with the same text)
     void                     ClearNotice();
     void                     SetNotice(std::string a_text, bool a_error = false);
 
