@@ -339,6 +339,219 @@ namespace LF
             return a_actor && g_followerFaction && a_actor->GetFactionRank(g_followerFaction, false) >= 1;
         }
 
+        // Diagnostics (user: followers' clothes come off after a load / storage): the armor, weapons and ammo a_actor
+        // wears right now, for the log. Main thread.
+        std::string WornLog(RE::Actor* a_actor)
+        {
+            if (!a_actor) {
+                return "worn: (no actor)";
+            }
+            std::string list;
+            int         n = 0;
+            auto inv = a_actor->GetInventory([](RE::TESBoundObject& a_obj) { return a_obj.IsArmor() || a_obj.IsWeapon() || a_obj.IsAmmo(); });
+            for (auto& [obj, data] : inv) {
+                if (obj && data.second && data.second->IsWorn()) {
+                    const char* name = obj->GetName();
+                    list += std::format("{}{} {:08X}", n++ ? ", " : "", name && *name ? name : "?", obj->GetFormID());
+                }
+            }
+            return std::format("worn {}: {}", n, n ? list : "nothing");
+        }
+
+        // Diagnostics (144, user: the belly sticks out after a summon / re-dress - "CBPC belly bone?"): the belly and
+        // breast nodes of a_actor's 3rd-person skeleton - local position (what CBPC / physics move) and scale (RaceMenu
+        // / morph transforms), for the log. Main thread.
+        std::string BoneLog(RE::Actor* a_actor)
+        {
+            auto root = a_actor ? a_actor->Get3D(false) : nullptr;
+            if (!root) {
+                return "bones: (no 3D)";
+            }
+            std::string out = "bones:";
+            for (const char* name : { "NPC L Breast", "NPC R Breast" }) {
+                auto node = root->GetObjectByName(name);
+                if (!node) {
+                    out += std::format(" [{}: none]", name);
+                    continue;
+                }
+                const auto& t = node->local.translate;
+                out += std::format(" [{}: pos {:.2f} {:.2f} {:.2f}, scale {:.2f}]", name, t.x, t.y, t.z, node->local.scale);
+            }
+            // (144c, user video 00-57-25: the belly still sticks out while "NPC Belly" is back at rest and no body
+            // morph is set) EVERY node whose name has "belly" in it (UBE / 3BA / SMP / CBPC have more belly bones)
+            std::function<void(RE::NiAVObject*)> walk = [&](RE::NiAVObject* a_obj) {
+                if (!a_obj) {
+                    return;
+                }
+                std::string n = a_obj->name.c_str();
+                std::string low = n;
+                std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (low.find("belly") != std::string::npos) {
+                    const auto& t = a_obj->local.translate;
+                    out += std::format(" [{}: pos {:.2f} {:.2f} {:.2f}, scale {:.2f}]", n, t.x, t.y, t.z, a_obj->local.scale);
+                }
+                if (auto node = a_obj->AsNode()) {
+                    for (auto& child : node->GetChildren()) {
+                        walk(child.get());
+                    }
+                }
+            };
+            walk(root);
+            // (145d, user: "log her genital bone") CBPC's belly bulge (HDT Belly) is pushed while a BellyBulgeNodes node
+            // (TNG / SOS "Genitals01" first) is in the vagina collider: every node whose name has "genital" or "vagina"
+            // in it, as its position in the pelvis' frame (same numbers wherever she stands / looks), to see whether her
+            // own penis sits inside her after a summon
+            auto pelvis = root->GetObjectByName("NPC Pelvis [Pelv]");
+            if (!pelvis) {
+                out += " [NPC Pelvis [Pelv]: none]";
+                return out;
+            }
+            const auto inv = pelvis->world.rotate.Transpose();
+            const float s = pelvis->world.scale > 0.0f ? pelvis->world.scale : 1.0f;
+            std::function<void(RE::NiAVObject*)> genitals = [&](RE::NiAVObject* a_obj) {
+                if (!a_obj) {
+                    return;
+                }
+                std::string n = a_obj->name.c_str();
+                std::string low = n;
+                std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (low.find("genital") != std::string::npos || low.find("vagina") != std::string::npos) {
+                    const auto rel = (inv * (a_obj->world.translate - pelvis->world.translate)) / s;
+                    out += std::format(" [{}: {:.1f} {:.1f} {:.1f} from pelvis]", n, rel.x, rel.y, rel.z);
+                }
+                if (auto node = a_obj->AsNode()) {
+                    for (auto& child : node->GetChildren()) {
+                        genitals(child.get());
+                    }
+                }
+            };
+            genitals(root);
+            // (145e, log 01:37: her own penis stayed in front of her pelvis even after a summon) CBPC counts OTHER actors'
+            // BellyBulgeNodes too: every loaded actor near her (you included) whose "Genitals0x" bones come within 30
+            // units of her pelvis, in her pelvis' frame
+            auto checkOther = [&](RE::Actor* a_other) {
+                if (!a_other || a_other == a_actor) {
+                    return;
+                }
+                auto oroot = a_other->Get3D(false);
+                if (!oroot || a_other->GetPosition().GetDistance(a_actor->GetPosition()) > 300.0f) {
+                    return;
+                }
+                for (int k = 1; k <= 6; ++k) {
+                    auto g = oroot->GetObjectByName(std::format("NPC Genitals0{} [Gen0{}]", k, k));
+                    if (!g) {
+                        continue;
+                    }
+                    const auto rel = (inv * (g->world.translate - pelvis->world.translate)) / s;
+                    if (rel.Length() <= 30.0f) {
+                        out += std::format(" [OTHER {} Gen0{}: {:.1f} {:.1f} {:.1f} from her pelvis]", DisplayName(a_other), k, rel.x, rel.y, rel.z);
+                    }
+                }
+            };
+            checkOther(RE::PlayerCharacter::GetSingleton());
+            if (auto pl = RE::ProcessLists::GetSingleton()) {
+                for (auto& h : pl->highActorHandles) {
+                    if (auto other = h.get()) {
+                        checkOther(other.get());
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Worn gear + belly / breast bones in one log text (the diagnostics lines of load, preset pass and summon).
+        std::string GearLog(RE::Actor* a_actor) { return WornLog(a_actor) + "; " + BoneLog(a_actor); }
+
+        // Diagnostics (144b, user pictures 2026-11-25: Vicky's belly stays out, naked too - not the clothes, and the belly
+        // bone is back at rest): every body morph RaceMenu's NiOverride holds for a_actor - morph name, key (who set it:
+        // a preset file, "OBody", a mod...) and value - one log line "<a_label> - body morphs: ...". Papyrus calls one
+        // after another (GetMorphNames -> GetMorphKeys -> GetMorphValue); non-zero values only.
+        struct MorphScan
+        {
+            RE::Actor*               actor = nullptr;
+            std::string              label;
+            std::vector<std::string> names;
+            std::size_t              ni = 0;
+            std::vector<std::string> keys;
+            std::size_t              ki = 0;
+            std::string              out;
+            int                      count = 0;
+        };
+
+        std::vector<std::string> StringsOf(const Papyrus::Variable& a_var)
+        {
+            std::vector<std::string> out;
+            if (a_var.IsArray()) {
+                if (auto arr = a_var.GetArray()) {
+                    for (std::uint32_t i = 0; i < arr->size(); ++i) {
+                        if ((*arr)[i].IsString()) {
+                            out.emplace_back((*arr)[i].GetString());
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        void MorphNextName(std::shared_ptr<MorphScan> a_s);
+
+        void MorphNextKey(std::shared_ptr<MorphScan> a_s)
+        {
+            if (a_s->ki >= a_s->keys.size()) {
+                ++a_s->ni;
+                MorphNextName(a_s);
+                return;
+            }
+            const RE::BSFixedString name(a_s->names[a_s->ni]);
+            const RE::BSFixedString key(a_s->keys[a_s->ki]);
+            const bool ok = Papyrus::CallStatic("NiOverride", "GetMorphValue", [a_s](const Papyrus::Variable& a_v) {
+                const float v = a_v.IsFloat() ? a_v.GetFloat() : 0.0f;
+                if (std::fabs(v) > 0.001f) {
+                    a_s->out += std::format(" [{} / {} = {:.3f}]", a_s->names[a_s->ni], a_s->keys[a_s->ki], v);
+                    ++a_s->count;
+                }
+                ++a_s->ki;
+                MorphNextKey(a_s);
+            }, static_cast<RE::TESObjectREFR*>(a_s->actor), name, key);
+            if (!ok) {
+                Out(std::format("{} - body morphs: GetMorphValue call failed", a_s->label));
+            }
+        }
+
+        void MorphNextName(std::shared_ptr<MorphScan> a_s)
+        {
+            if (a_s->ni >= a_s->names.size()) {
+                Out(std::format("{} - body morphs ({} set):{}", a_s->label, a_s->count, a_s->count ? a_s->out : " none"));
+                return;
+            }
+            const RE::BSFixedString name(a_s->names[a_s->ni]);
+            const bool ok = Papyrus::CallStatic("NiOverride", "GetMorphKeys", [a_s](const Papyrus::Variable& a_v) {
+                a_s->keys = StringsOf(a_v);
+                a_s->ki = 0;
+                MorphNextKey(a_s);
+            }, static_cast<RE::TESObjectREFR*>(a_s->actor), name);
+            if (!ok) {
+                Out(std::format("{} - body morphs: GetMorphKeys call failed", a_s->label));
+            }
+        }
+
+        void MorphLog(RE::Actor* a_actor, std::string a_label)
+        {
+            if (!a_actor || !Papyrus::HasFunction("NiOverride", "GetMorphNames") || !Papyrus::HasFunction("NiOverride", "GetMorphKeys") ||
+                !Papyrus::HasFunction("NiOverride", "GetMorphValue")) {
+                Out(std::format("{} - body morphs: NiOverride morph functions not found", a_label));
+                return;
+            }
+            auto s = std::make_shared<MorphScan>();
+            s->actor = a_actor;
+            s->label = std::move(a_label);
+            Papyrus::CallStatic("NiOverride", "GetMorphNames", [s](const Papyrus::Variable& a_v) {
+                s->names = StringsOf(a_v);
+                s->ni = 0;
+                MorphNextName(s);
+            }, static_cast<RE::TESObjectREFR*>(a_actor));
+        }
+
         // Runs a_fn on the main thread (SKSE task).
         void OnMain(std::function<void()> a_fn)
         {
@@ -390,7 +603,194 @@ namespace LF
             g_timerWake.notify_one();
         }
 
+
+        // (145j) The loaded actor (you included, a_actor itself not) closest to a_point: distance and name.
+        std::pair<float, std::string> NearestOther(RE::Actor* a_actor, const RE::NiPoint3& a_point)
+        {
+            std::pair<float, std::string> best{ 1.0e9f, {} };
+            auto check = [&](RE::Actor* a_other) {
+                if (!a_other || a_other == a_actor || a_other->IsDisabled() || !a_other->Is3DLoaded()) {
+                    return;
+                }
+                if (const float d = a_other->GetPosition().GetDistance(a_point); d < best.first) {
+                    best = { d, DisplayName(a_other) };
+                }
+            };
+            check(RE::PlayerCharacter::GetSingleton());
+            if (auto pl = RE::ProcessLists::GetSingleton()) {
+                for (auto& h : pl->highActorHandles) {
+                    if (auto other = h.get()) {
+                        check(other.get());
+                    }
+                }
+            }
+            return best;
+        }
+
+        // (145j, log 2026-11-25 13:02: every summon put its follower on the same point, 120 units in front of you -
+        // Vicky landed on Penny, and both got stuck breast / belly bones the moment the other's body appeared; CBPC
+        // collides actors' bodies) where a summoned follower lands, as an offset from a_target: 120 units in front,
+        // else the first point around it (40 degree steps, left / right) with no other loaded actor within kClearance.
+        // Returns dx, dy and the angle from straight ahead (degrees).
+        constexpr float kSummonFront = 120.0f;
+        constexpr float kClearance = 70.0f;
+
+        // A spot picked in the last 5 s counts as taken (the follower sent there may not have arrived yet:
+        // Summon of several followers one after another). Main thread only.
+        struct TakenSpot
+        {
+            RE::NiPoint3                          pos;
+            std::chrono::steady_clock::time_point until;
+        };
+        std::vector<TakenSpot> g_takenSpots;
+
+        std::tuple<float, float, int> FreeSpot(RE::Actor* a_actor, RE::TESObjectREFR* a_target)
+        {
+            constexpr float kDeg = 3.14159265f / 180.0f;
+            const float     facing = a_target->GetAngleZ();  // radians, 0 = north (+Y), clockwise
+            const auto      base = a_target->GetPosition();
+            const auto      now = std::chrono::steady_clock::now();
+            std::erase_if(g_takenSpots, [now](const TakenSpot& t) { return t.until < now; });
+            std::tuple<float, float, int> pick{ kSummonFront * std::sin(facing), kSummonFront * std::cos(facing), 0 };  // all taken: in front
+            for (int deg : { 0, -40, 40, -80, 80, -120, 120 }) {
+                const float        ang = facing + deg * kDeg;
+                const float        dx = kSummonFront * std::sin(ang);
+                const float        dy = kSummonFront * std::cos(ang);
+                const RE::NiPoint3 p(base.x + dx, base.y + dy, base.z);
+                const bool         reserved = std::any_of(g_takenSpots.begin(), g_takenSpots.end(),
+                            [&p](const TakenSpot& t) { return t.pos.GetDistance(p) < kClearance; });
+                if (!reserved && NearestOther(a_actor, p).first >= kClearance) {
+                    pick = { dx, dy, deg };
+                    break;
+                }
+            }
+            g_takenSpots.push_back({ RE::NiPoint3(base.x + std::get<0>(pick), base.y + std::get<1>(pick), base.z), now + std::chrono::seconds(5) });
+            return pick;
+        }
+
+        // Diagnostics (145h, user: belly / breasts randomly stuck after a summon, not the outfit, not SMP, re-equip
+        // doesn't help, another Storage -> Summon does): one short line every 0.25 s for 8 s after a summon - the 3D
+        // root's address (a new one = the 3D was rebuilt) and the breast / HDT Belly offsets - to see at which step
+        // (3D creation, re-dress, LoadCharacterEx) the bones jump.
+        void TrackBones(RE::ActorHandle a_handle, std::string a_name, int a_step = 0)
+        {
+            auto ptr = a_handle.get();
+            auto a = ptr.get();
+            if (!a || a_step > 32) {
+                return;
+            }
+            std::string line = std::format("{} - track {:.2f} s:", a_name, a_step * 0.25f);
+            auto root = a->Get3D(false);
+            if (!root) {
+                line += " no 3D";
+            } else {
+                line += std::format(" 3D {:X}", reinterpret_cast<std::uintptr_t>(root) & 0xFFFFFF);
+                for (const char* n : { "NPC L Breast", "NPC R Breast", "HDT Belly" }) {
+                    if (auto node = root->GetObjectByName(n)) {
+                        const auto& t = node->local.translate;
+                        line += std::format(" | {} {:.1f} {:.1f} {:.1f}", n, t.x, t.y, t.z);
+                    }
+                }
+                // (145j) a body overlapping hers pushes these bones (CBPC collision between actors)
+                if (const auto [d, who] = NearestOther(a, a->GetPosition()); !who.empty()) {
+                    line += std::format(" | nearest {} {:.0f}", who, d);
+                }
+            }
+            Out(line);
+            After(0.25f, [a_handle, a_name, a_step]() { OnMain([a_handle, a_name, a_step]() { TrackBones(a_handle, a_name, a_step + 1); }); });
+        }
         // ---- per-follower game changes (main thread) ----
+
+        // (142, user: "the enable and disable we added causes the actors to unequip their armor"; log 2026-11-22: Vicky
+        // bare right after the summon's Disable / MoveTo / Enable, Ciel / Vicky bare as soon as they loaded in from
+        // home) a follower whose 3D is built new by one of our moves loses the armor / weapons it wore. What it wears is
+        // remembered before the move (Storage, summon, Override apply) and put back once it has loaded again.
+        std::vector<RE::FormID> WornIds(RE::Actor* a_actor)
+        {
+            std::vector<RE::FormID> out;
+            if (!a_actor) {
+                return out;
+            }
+            // (142b) playable items only: non-playable ones (HDTSMPObjectBase / HDTSmpCollision...) are put on and
+            // swapped by their own physics mod - re-equipping an old one would fight it
+            auto inv = a_actor->GetInventory([](RE::TESBoundObject& a_obj) { return (a_obj.IsArmor() || a_obj.IsWeapon() || a_obj.IsAmmo()) && a_obj.GetPlayable(); });
+            for (auto& [obj, data] : inv) {
+                if (obj && data.second && data.second->IsWorn()) {
+                    out.push_back(obj->GetFormID());
+                }
+            }
+            return out;
+        }
+
+        // Remembers what a_slot's actor wears now. a_overwrite false: a list already there (e.g. from Storage) is kept.
+        void RememberWorn(int a_slot, RE::Actor* a_actor, bool a_overwrite)
+        {
+            if (!a_actor || a_slot < 0) {
+                return;
+            }
+            auto            ids = WornIds(a_actor);
+            std::lock_guard lock(g_lock);
+            if (a_slot < static_cast<int>(g_slots.size()) && (a_overwrite || g_slots[a_slot].dress.empty())) {
+                g_slots[a_slot].dress = std::move(ids);
+            }
+        }
+
+        // Puts a_slot's remembered gear back on once its actor is enabled with 3D (checked 4x a second, 10 s at most;
+        // not there by then: the list stays for the next summon). Only items it still has and does not wear.
+        void Redress(int a_slot, int a_tries = 40)
+        {
+            auto actor = ActorOf(a_slot);
+            if (!actor) {
+                return;
+            }
+            std::vector<RE::FormID> ids;
+            {
+                std::lock_guard lock(g_lock);
+                if (a_slot >= static_cast<int>(g_slots.size()) || g_slots[a_slot].dress.empty()) {
+                    return;
+                }
+                ids = g_slots[a_slot].dress;
+            }
+            if (!actor->Is3DLoaded() || actor->IsDisabled()) {
+                if (a_tries > 0) {
+                    After(0.25f, [a_slot, a_tries]() { OnMain([a_slot, a_tries]() { Redress(a_slot, a_tries - 1); }); });
+                }
+                return;
+            }
+            {
+                std::lock_guard lock(g_lock);
+                g_slots[a_slot].dress.clear();
+            }
+            auto       mgr = RE::ActorEquipManager::GetSingleton();
+            const auto worn = WornIds(actor);
+            auto       inv = actor->GetInventory();
+            int        n = 0;
+            int        gone = 0;
+            for (auto id : ids) {
+                auto obj = RE::TESForm::LookupByID<RE::TESBoundObject>(id);
+                if (!mgr || !obj || std::find(worn.begin(), worn.end(), id) != worn.end()) {
+                    continue;
+                }
+                if (auto it = inv.find(obj); it == inv.end() || it->second.first <= 0) {
+                    ++gone;  // given away / taken meanwhile
+                    continue;
+                }
+                mgr->EquipObject(actor, obj, nullptr, 1, nullptr, false, false, false, true);  // not queued: worn when the pass end reads it
+                ++n;
+            }
+            if (n || gone) {  // (142b) the list is kept after every pass: no line when everything was still on
+                Out(std::format("{} - re-dressed: {} of {} remembered items put back on ({} no longer in its inventory); {}", DisplayName(actor), n, ids.size(), gone, BoneLog(actor)));
+            }
+            if (n) {  // diagnostics (144): the bones once the new body mesh is attached and physics ran a moment
+                After(1.0f, [a_slot]() {
+                    OnMain([a_slot]() {
+                        if (auto a = ActorOf(a_slot)) {
+                            Out(std::format("{} - 1 s after the re-dress: {}", DisplayName(a), BoneLog(a)));
+                        }
+                    });
+                });
+            }
+        }
 
         void ScheduleUpdate(int a_slot, bool a_full, bool a_playerFace = false, bool a_body = false);
 
@@ -419,6 +819,12 @@ namespace LF
         std::vector<std::uint8_t> g_resetLook;  // per slot: next full pass first clears the preset (Apply Settings)
         std::vector<std::chrono::steady_clock::time_point> g_freshUntil;  // per slot: a full apply just finished on the loaded actor - lite passes until then skip the reload
         std::vector<std::uint8_t> g_loadWait;  // per slot (g_lock): after a load its 3D was not there yet - WaitForLoad polls (109)
+        std::vector<std::chrono::steady_clock::time_point> g_loadedAt;  // per slot (g_lock): when its 3D last loaded (3D-load event) (145i)
+
+        // (145i, log 2026-11-25 11:33:02: "HDT Belly" 0 -> 11 and a breast to 5 the moment our preset load ran 0.25 s
+        // after the summoned follower's 3D appeared; stuck there) a lite pass loads the preset only once the 3D has
+        // been there this long, so CBPC has settled on the new body first.
+        constexpr float kPhysicsSettle = 1.5f;
 
         // A chain step that waits a_seconds (main-thread timer), then lets the chain go on.
         Papyrus::Chain::Step WaitStep(float a_seconds)
@@ -916,6 +1322,7 @@ namespace LF
             const auto fullMode = std::int32_t(GetGlobal(Global::kLiteMode));
             const auto liteMode = std::int32_t(a_body ? fullMode : (fullMode & ~2));
             if (!a_full && !a_body && a_slot < static_cast<int>(g_freshUntil.size()) && now < g_freshUntil[a_slot] && ps.gen == gen) {
+                Redress(a_slot, 0);  // (142b) remembered gear first, like a full lite pass
                 if (liteMode & 1) {
                     Papyrus::CallStatic("NiOverride", "ApplyNodeOverrides", {}, static_cast<RE::TESObjectREFR*>(actor));
                 }
@@ -937,6 +1344,9 @@ namespace LF
             // SofiaHeadHP and face animation (MuFacialExpressionExtended) crashed on it, as in (70) / (76)): a shown
             // real NPC is disabled BEFORE race + preset (like Remove's "head taken away first") and enabled after.
             auto hidden = std::make_shared<bool>(false);
+            if (a_full && s.real && actor->Is3DLoaded() && !actor->IsDisabled()) {
+                RememberWorn(a_slot, actor, true);  // (142) its 3D is rebuilt below (Disable / Enable): gear put back at the end
+            }
             if (a_full && s.real) {
                 chain->Then([actor, hidden](Papyrus::Done d) {
                     *hidden = actor->Is3DLoaded() && !actor->IsDisabled();
@@ -994,9 +1404,41 @@ namespace LF
                     WaitLoaded(actor, 20, d);
                     return true;
                 });
+                // (145i) then until its 3D has been there kPhysicsSettle seconds (see there)
+                chain->Then([a_slot, name = s.name](Papyrus::Done d) {
+                    std::chrono::steady_clock::time_point at{};
+                    {
+                        std::lock_guard lock(g_lock);
+                        if (a_slot < static_cast<int>(g_loadedAt.size())) {
+                            at = g_loadedAt[a_slot];
+                        }
+                    }
+                    const float left = kPhysicsSettle - std::chrono::duration<float>(std::chrono::steady_clock::now() - at).count();
+                    if (left <= 0.0f) {
+                        return false;
+                    }
+                    Out(std::format("{} - 3D loaded {:.2f} s ago: preset load waits {:.2f} s (body physics settle)", name, kPhysicsSettle - left, left));
+                    return WaitStep(left)(d);
+                });
             }
             const std::string what = a_full ? (head ? "Headmesh Full" : "Full") : (head ? "HeadMesh Lite" : "Lite");
-            chain->ThenDo([what, name = s.name, p = s.preset]() { Out(std::format("{} - applying preset - {} - {}", name, what, p)); });
+            chain->ThenDo([what, name = s.name, p = s.preset, actor]() {
+                Out(std::format("{} - applying preset - {} - {}", name, what, p));
+                OnMain([actor, name]() { Out(std::format("{} - before the preset load: {}", name, GearLog(actor))); });  // diagnostics (gear)
+            });
+            // (142b, user video 2026-11-25 00-08-58: Penny stayed bare - the re-dress at the summon ran 0.6 s after it, on
+            // a 3D that was built new right after; Vicky's belly / breast physics off - her clothes went on after the
+            // preset had set the body up) remembered gear goes back on HERE: 3D there (a lite pass waited for it), before
+            // the preset / body morphs and node transforms load. A real NPC's full pass rebuilds the 3D later: pass end.
+            if (!a_full) {
+                chain->Then([a_slot](Papyrus::Done d) {
+                    OnMain([a_slot, d]() {
+                        Redress(a_slot, 0);
+                        d(Papyrus::Variable{});
+                    });
+                    return true;
+                });
+            }
             if (a_full) {
                 // NG fix (user: "sometimes the belly protrudes"): preset body morphs are saved under the key of
                 // whoever made them (Penny.jslot: "OBody"); morphs already on the actor that the preset does not
@@ -1147,7 +1589,26 @@ namespace LF
             chain->ThenDo([a_slot]() {
                 OnMain([a_slot]() {
                     RefreshPlayerFace();
+                    Redress(a_slot);  // (142) after a real NPC's rebuild (nothing remembered: does nothing)
                     auto a = ActorOf(a_slot);
+                    // (142b) what it wears now is what the next pass puts back (a follower dismissed by Storage is no
+                    // teammate until recruited again; the game takes a non-teammate's clothes on every 3D rebuild -
+                    // Vicky 00:10:22). Not while the re-dress above still waits for the 3D.
+                    if (a && a->Is3DLoaded() && !a->IsDisabled()) {
+                        RememberWorn(a_slot, a, true);
+                    }
+                    if (a) {  // diagnostics (user: clothes come off after a load): worn at the end of the pass and 10 s later
+                        Out(std::format("{} - preset pass done: {}", DisplayName(a), GearLog(a)));
+                        MorphLog(a, DisplayName(a) + " - preset pass done");  // diagnostics (144b)
+                        After(10.0f, [a_slot]() {
+                            OnMain([a_slot]() {
+                                if (auto b = ActorOf(a_slot)) {
+                                    Out(std::format("{} - 10 s after the preset pass: {}", DisplayName(b), GearLog(b)));
+                                    MorphLog(b, DisplayName(b) + " - 10 s after the preset pass");
+                                }
+                            });
+                        });
+                    }
                     if (a && a->Is3DLoaded() && a_slot < static_cast<int>(g_freshUntil.size())) {
                         g_freshUntil[a_slot] = std::chrono::steady_clock::now() + std::chrono::seconds(8);
                     }
@@ -1223,6 +1684,33 @@ namespace LF
         void ScheduleUpdate(int a_slot, bool a_full, bool a_playerFace, bool a_body)
         {
             After(kLoadDelay, [a_slot, a_full, a_playerFace, a_body]() { UpdateFollower(a_slot, a_full, a_playerFace, a_body); });
+        }
+
+        // (145k, Docs/cbpc-structure.md; user: "build it") CBPC 1.7.3 binds an actor's physics ONCE (by form ID) and keeps raw
+        // pointers to that 3D's nodes for its colliders; a new 3D (our Disable / MoveTo / Enable, Storage -> Summon, a
+        // follower loading in again) is never re-bound, so the old body's colliders stay as phantoms inside the new
+        // one: "HDT Belly" gets CBPC's belly bulge (up to 20), the breasts are pushed to their limits, until the next
+        // cell change / load. CBPCPluginScript.ReloadConfig() (= console "cbpc reload") makes CBPC re-bind every actor
+        // to its current 3D on its next frame. Called once, kCbpcRebindDelay after a follower's 3D loaded; several
+        // loads in that time share one call (it re-reads CBPC's config files: a short hitch).
+        constexpr float kCbpcRebindDelay = 0.75f;
+        // when the call already scheduled runs (main thread only; a time, not a flag: After() drops jobs on a load)
+        std::chrono::steady_clock::time_point g_cbpcRebindDue{};
+
+        void CbpcRebind(const std::string& a_why)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < g_cbpcRebindDue) {
+                return;  // one is coming: it sees this 3D too
+            }
+            g_cbpcRebindDue = now + std::chrono::milliseconds(static_cast<int>(kCbpcRebindDelay * 1000.0f));
+            After(kCbpcRebindDelay, [a_why]() {
+                if (!Papyrus::GameReady() || !Papyrus::HasFunction("CBPCPluginScript", "ReloadConfig")) {
+                    return;  // no CBPC (or its script) installed
+                }
+                Papyrus::CallStatic("CBPCPluginScript", "ReloadConfig", {});
+                Out(std::format("CBPC physics re-bound to the current 3D (ReloadConfig) - {}", a_why));
+            });
         }
 
         // Spells: add / remove on the actor (the game saves added spells itself).
@@ -1787,7 +2275,7 @@ namespace LF
             }
             const auto calls = FindOwnDismiss(a_actor);
             const auto name = DisplayName(a_actor);
-            Out(std::format("{} before it leaves you (give-back / storage): {}", name, FollowState(a_actor)));
+            Out(std::format("{} before it leaves you (give-back / storage): {}; {}", name, FollowState(a_actor), WornLog(a_actor)));
             for (auto& c : calls) {
                 Out(std::format("{} still follows you - dismissed with {}.DismissFollower (quest {:08X})", name, c.script, c.quest->GetFormID()));
                 a_chain.Then([c](Papyrus::Done d) {
@@ -2031,6 +2519,8 @@ namespace LF
                 s.added = false;  // out of the Followers list
                 s.keep = false;
                 s.preSummon = false;
+                s.home = false;
+                s.dress.clear();
                 defRace = s.defaultRace;
                 defSkin = s.defaultSkin;
                 defOutfit = s.defaultOutfit;
@@ -2094,11 +2584,26 @@ namespace LF
             if (!a_actor || !a_target) {
                 return;
             }
-            constexpr float kFront = 120.0f;
-            const float     angle = a_target->GetAngleZ();  // radians, 0 = north (+Y), clockwise
-            const float     dx = kFront * std::sin(angle);
-            const float     dy = kFront * std::cos(angle);
+            const int slotOf = SlotOfActor(a_actor);
+            bool      active = false;
+            if (slotOf >= 0) {
+                std::lock_guard lock(g_lock);
+                g_slots[slotOf].home = false;  // (141b) a taken-over NPC sent home is back: Storage button again
+                active = g_slots[slotOf].Active();
+            }
+            const auto  freeSpot = FreeSpot(a_actor, a_target);  // (145j) not on top of another actor
+            const float dx = std::get<0>(freeSpot);
+            const float dy = std::get<1>(freeSpot);
+            const int   spot = std::get<2>(freeSpot);
             auto            chain = Papyrus::Chain::Make();
+            // (145, user picked "A"; logs 2026-11-22..25: clothes only came off when a follower Storage had dismissed -
+            // teammate off - got a new 3D; the re-dress that followed knocked CBPC's "HDT Belly" out of place) a summoned
+            // follower is your teammate again BEFORE it is moved / enabled, so its new 3D keeps its clothes. Recruiting
+            // in its own mod (follow package, NFF / Sofia's quest) stays with that mod's dialogue.
+            if (active && !a_actor->IsPlayerTeammate()) {
+                chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "Actor", "SetPlayerTeammate", d, true, true); });
+                chain->ThenDo([name = DisplayName(a_actor)]() { Out(std::format("{} - player teammate again (summon)", name)); });
+            }
             if (a_actor->IsDisabled()) {
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Enable", d, false); });
             }
@@ -2107,7 +2612,9 @@ namespace LF
             // jump. Such an actor is disabled for the move and enabled at its new place - fresh 3D, fresh physics.
             // Not loaded (e.g. fresh from storage): moved as before.
             const bool blink = !a_actor->IsDisabled() && a_actor->Is3DLoaded();
+            // (142) what it wears now, unless Storage already remembered it (it may be bare by now) - put back on arrival
             if (blink) {
+                RememberWorn(slotOf, a_actor, false);
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Disable", d, false); });
             }
             chain->Then([a_actor, a_target, dx, dy](Papyrus::Done d) {
@@ -2116,10 +2623,17 @@ namespace LF
             if (blink) {
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Enable", d, false); });
             }
-            chain->ThenDo([a_actor, a_target, a_then]() {
-                OnMain([a_actor, a_target, a_then]() {
-                    Out(std::format("Summoned {}: {:.0f} units from {}, disabled {}", DisplayName(a_actor),
-                        a_actor->GetPosition().GetDistance(a_target->GetPosition()), DisplayName(a_target), a_actor->IsDisabled()));
+            chain->ThenDo([a_actor, a_target, a_then, spot]() {
+                OnMain([a_actor, a_target, a_then, spot]() {
+                    Out(std::format("Summoned {}: {:.0f} units from {} ({} degrees from straight ahead), disabled {}, {}", DisplayName(a_actor),
+                        a_actor->GetPosition().GetDistance(a_target->GetPosition()), DisplayName(a_target), spot, a_actor->IsDisabled(), GearLog(a_actor)));
+                    TrackBones(a_actor->GetHandle(), DisplayName(a_actor));  // diagnostics (145h)
+                    After(5.0f, [a_actor]() {  // diagnostics (user: gear off after storage)
+                        OnMain([a_actor]() {
+                            Out(std::format("{} - 5 s after the summon: {}", DisplayName(a_actor), GearLog(a_actor)));
+                            MorphLog(a_actor, DisplayName(a_actor) + " - 5 s after the summon");  // diagnostics (144b)
+                        });
+                    });
                     if (a_then) {
                         a_then();
                         return;
@@ -2549,8 +3063,7 @@ namespace LF
                 if (auto a = ActorOf(static_cast<int>(i))) {
                     s.live[i].enabled = !a->IsDisabled();
                     s.live[i].loaded = a->Is3DLoaded();
-                    s.live[i].following = Following(a);
-                }
+                    s.live[i].following = Following(a);                }
             }
             if (auto a = ActorOf(g_snapSelected.load())) {
                 FillWhere(a, s);
@@ -2579,6 +3092,8 @@ namespace LF
         constexpr std::uint32_t kRecKeep = 'KEEP';   // NG (user): ref of a slot with Keep in New Game ticked
         constexpr std::uint32_t kRecPreSummon = 'PSUM';  // NG (user): ref of a slot with Pre Summon ticked
         constexpr std::uint32_t kRecErin = 'ERIN';       // NG (user): ref + Erin Preset file of an active slot
+        constexpr std::uint32_t kRecHome = 'HOME';       // (141b): ref of a taken-over NPC sent home by Storage
+        constexpr std::uint32_t kRecDress = 'DRES';      // (142): ref + the gear it wore before Storage (put back on its summon)
         constexpr std::uint32_t kRecRealText = 'RTXT';  // NG: a real NPC's own reference name data (after its REAL)
         constexpr std::uint32_t kRecOwnGear = 'OWNG';  // NG: ref + a real NPC's own gear taken off at the take-over (after its REAL)
         constexpr std::uint32_t kRecReal = 'REAL';   // NG 1.2: a real NPC entry: ref, base, its own name / race / sex (before SLOT...)
@@ -2719,6 +3234,16 @@ namespace LF
                 if (s.preSummon && s.ref && a_intfc->OpenRecord(kRecPreSummon, kVersion)) {
                     WriteForm(a_intfc, s.ref);
                 }
+                if (s.home && s.Active() && s.ref && a_intfc->OpenRecord(kRecHome, kVersion)) {
+                    WriteForm(a_intfc, s.ref);
+                }
+                if (!s.dress.empty() && s.Active() && s.ref && a_intfc->OpenRecord(kRecDress, kVersion)) {
+                    WriteForm(a_intfc, s.ref);
+                    a_intfc->WriteRecordData(static_cast<std::uint32_t>(s.dress.size()));
+                    for (auto id : s.dress) {
+                        WriteForm(a_intfc, id);
+                    }
+                }
                 if (s.Active() && s.ref && !s.erinPreset.empty() && a_intfc->OpenRecord(kRecErin, kVersion)) {
                     WriteForm(a_intfc, s.ref);
                     WriteString(a_intfc, s.erinPreset);
@@ -2757,6 +3282,8 @@ namespace LF
                 s.added = false;
                 s.keep = false;
                 s.preSummon = false;
+                s.home = false;
+                s.dress.clear();
                 s.statDefaults.clear();
                 s.spells.clear();
             }
@@ -3088,6 +3615,26 @@ namespace LF
                     if (it != g_slots.end()) {
                         it->preSummon = true;
                     }
+                } else if (type == kRecHome) {
+                    const auto ref = ReadForm(a_intfc);
+                    auto it = std::find_if(g_slots.begin(), g_slots.end(), [&](const Slot& s) { return ref && s.ref == ref; });
+                    if (it != g_slots.end()) {
+                        it->home = true;
+                    }
+                } else if (type == kRecDress) {
+                    const auto              ref = ReadForm(a_intfc);
+                    std::uint32_t           n = 0;
+                    std::vector<RE::FormID> ids;
+                    a_intfc->ReadRecordData(n);
+                    for (std::uint32_t k = 0; k < n && k < 200; ++k) {
+                        if (const auto id = ReadForm(a_intfc)) {
+                            ids.push_back(id);
+                        }
+                    }
+                    auto it = std::find_if(g_slots.begin(), g_slots.end(), [&](const Slot& s) { return ref && s.ref == ref; });
+                    if (it != g_slots.end()) {
+                        it->dress = std::move(ids);
+                    }
                 } else if (type == kRecErin) {
                     const auto  ref = ReadForm(a_intfc);
                     std::string file;
@@ -3237,6 +3784,21 @@ namespace LF
                     }
                 }
                 if (i >= 0) {
+                    {
+                        std::lock_guard lock(g_lock);
+                        if (g_loadedAt.size() < g_slots.size()) {
+                            g_loadedAt.resize(g_slots.size());
+                        }
+                        g_loadedAt[i] = std::chrono::steady_clock::now();  // (145i) for kPhysicsSettle
+                    }
+                    {
+                        std::string who;
+                        {
+                            std::lock_guard lock(g_lock);
+                            who = g_slots[i].name;
+                        }
+                        OnMain([who]() { CbpcRebind(who + "'s 3D loaded"); });  // (145k)
+                    }
                     if (TakeLoadWait(i)) {
                         std::string name;
                         {
@@ -3775,7 +4337,8 @@ namespace LF
                 continue;
             }
             if (a->Is3DLoaded()) {
-                Out(std::format("{} - loaded with the game - preset pass", name));
+                Out(std::format("{} - loaded with the game - preset pass ({})", name, GearLog(a)));
+                MorphLog(a, name + " - loaded with the game");  // diagnostics (144b)
                 ScheduleUpdate(i, false);
                 continue;
             }
@@ -3907,13 +4470,10 @@ namespace LF
                 return;
             }
             Meet(RE::PlayerCharacter::GetSingleton());
-            if (auto a = CrosshairActor()) {
-                const int slot = SlotOfActor(a);
-                if (slot >= 0) {
-                    g_selectRequest = slot;  // the MCM selected the follower under the crosshair
-                } else {
-                    Meet(a);
-                }
+            // (143, user: "crosshair / console target doesn't change whatever follower is selected on the Followers
+            // page"): the MCM selected the follower under the crosshair here - not any more; only met (voice / race lists)
+            if (auto a = CrosshairActor(); a && SlotOfActor(a) < 0) {
+                Meet(a);
             }
             BuildLists();
         });
@@ -5198,13 +5758,21 @@ namespace LF
                 return;
             }
             const auto name = DisplayName(actor);
+            if (!actor->IsDisabled() && actor->Is3DLoaded()) {
+                RememberWorn(a_slot, actor, true);  // (142) put back on when it is summoned again
+            }
             if (IsReal(a_slot)) {
                 // NG (user: "send her home but keep the button as Storage"): a taken-over NPC lives in the world (its own
                 // quests / scenes) - no storage cell: dismissed in its own mod, sent to its own place, look / name /
                 // gear kept (unlike Remove). Summon NPC brings it back.
+                {
+                    std::lock_guard lock(g_lock);
+                    g_slots[a_slot].home = true;  // (141b) no Storage button until Summon NPC brings it back
+                }
                 WwmUnregister(actor->GetFormID());
                 auto chain = Papyrus::Chain::Make();
                 AddOwnDismiss(*chain, actor);
+                chain->ThenDo([actor, name]() { OnMain([actor, name]() { Out(std::format("{} - after its dismiss: {}", name, WornLog(actor))); }); });  // diagnostics (gear)
                 chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "MoveToMyEditorLocation", d); });
                 chain->ThenDo([name]() { Out(std::format("{} sent home (taken over - look and settings kept)", name)); });
                 chain->Run();
@@ -5217,11 +5785,12 @@ namespace LF
             }
             auto chain = Papyrus::Chain::Make();
             AddOwnDismiss(*chain, actor);  // stops following first (else a follow catch-up could bring it back)
+            chain->ThenDo([actor, name]() { OnMain([actor, name]() { Out(std::format("{} - after its dismiss: {}", name, WornLog(actor))); }); });  // diagnostics (gear)
             if (g_marker) {
                 chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "MoveTo", d, g_marker, 0.0f, 0.0f, 0.0f, true); });
             }
             chain->Then([actor](Papyrus::Done d) { return Papyrus::CallMethod(actor, "ObjectReference", "Disable", d, false); });
-            chain->ThenDo([name]() { Out(std::format("{} sent to storage (settings kept)", name)); });
+            chain->ThenDo([actor, name]() { OnMain([actor, name]() { Out(std::format("{} sent to storage (settings kept), {}", name, WornLog(actor))); }); });
             chain->Run();
             SetNotice(std::format("{} went to storage - everything kept. Summon NPC brings it back.", name));
         });

@@ -46,6 +46,7 @@ add_commonlibsse_plugin(
         src/Menu.cpp
         src/Hotkey.cpp
         src/Voice.cpp
+        src/LipLog.cpp
 )
 
 target_precompile_headers(${PROJECT_NAME} PRIVATE include/PCH.h)

@@ -51,6 +51,8 @@ namespace LF
         bool                    added = false;  // NG: in the Followers list (Add Follower) but no preset applied yet
         bool                    keep = false;   // NG (user): "Keep in New Game" - written to the keep file, back in a new game
         bool                    preSummon = false;  // NG (user): "Pre Summon" - a new game brings the kept follower to the player
+        std::vector<RE::FormID> dress;  // (142, user: gear off after Storage / summon) worn before our move rebuilt its 3D - put back after (co-save DRES)
+        bool                    home = false;  // NG (user): a taken-over NPC sent home by Storage (no Storage button) until a summon (co-save HOME)
         std::string             erinPreset;  // NG (user): Erin race extra preset "<file>.ini" in Data/SKSE/Plugins/ErinRace/Preset ("" = none)
         // NG 1.2 (user, like PROTEUS): a real NPC of the game (e.g. Sofia) instead of a Lazy Followers slot actor -
         // made by Apply Settings when a slot gets a modded voice whose own NPC is in the game. It gets preset, race

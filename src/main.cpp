@@ -2,6 +2,7 @@
 
 #include "Hotkey.h"
 #include "LF.h"
+#include "LipLog.h"
 #include "Menu.h"
 #include "Voice.h"
 
@@ -77,6 +78,7 @@ namespace
             if (LF::FormsFound()) {
                 LF::InstallSinks();
                 Voice::Install();  // modded voices: follower lines in that voice
+                LipLog::Install();  // (146b) diagnostics: voice line / lip sync log
                 LF::InstallInventoryHook();  // NG (user): Open Inventory shows every item
                 Voice::StartOwnerScan();  // modded follower voices from the plugin files (Override box)
             }

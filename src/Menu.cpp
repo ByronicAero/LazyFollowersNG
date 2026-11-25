@@ -768,7 +768,7 @@ namespace Menu
         {
             const bool any = a_snap.slots[g_selected].Listed();
             BeginRow("Follower", "The follower these pages work on (name + base NPC form ID).\nAdd Follower (Followers page) adds one; Remove takes it off the list.\n"
-                                 "Opening the Followers page while looking at a follower selects it.");
+                                 "The crosshair / console target does not change it.");
             if (!any) {
                 TextDisabled(a_add ? "No followers yet - press Add Follower." : "No followers yet - add one on the Followers page.");
             } else {
@@ -1245,7 +1245,10 @@ namespace Menu
                     LF::TeleportTo(g_selected);
                 }
             }
-            if (s.Active() && live.enabled) {  // NG (user): storage without losing anything (a taken-over NPC: sent home)
+            // NG (user): storage without losing anything (a taken-over NPC: sent home). Fix (user: "Storage button doesn't
+            // disappear" on a taken-over NPC): sent home it stays enabled, so Store marks it (Slot::home) until a summon.
+            // Its follow state can not be read: Sofia's / NFF's follower aliases stay filled after their own dismiss.
+            if (s.Active() && live.enabled && !s.home) {
                 NextTo("Storage");
                 if (ConfirmButton("Storage", s.real ? "Sends the NPC home (its own place in the world - its own quests keep working); it stays taken over:\n"
                                                       "preset, name, voice, stats, spells and gear are KEPT (Remove gives it back). It stops following\n"
