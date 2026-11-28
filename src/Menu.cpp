@@ -2292,6 +2292,12 @@ namespace Menu
             FlagRow("Custom Classes", "Followers use the class picked on the Followers page.", LF::ClassesEnabled(), LF::SetClassesEnabled);
             FlagRow("Custom Spells", "Off greys out the Spells page. Spells already added stay on the followers.",
                 LF::SpellsEnabled(), LF::SetSpellsEnabled);
+            // NG (150, user: Storage / summon put a naked follower's clothes back on)
+            FlagRow("Keep Clothes", "Followers keep the clothes you leave them in: the game no longer puts on the best clothes\n"
+                                    "they carry when they load in, change area or are summoned (also after Storage).\n"
+                                    "Other mods that dress followers themselves (outfit managers) are not stopped.\n"
+                                    "Off: the game's normal re-dress. Game 1.6.1170 only.",
+                LF::KeepClothes(), LF::SetKeepClothes);
 
             // NG (user): the every-item inventory lists as options (game 1.6.1170 only)
             Section("Inventory");

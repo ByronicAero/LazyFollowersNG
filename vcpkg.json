@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "lazyfollowersng",
-  "version-string": "1.5.2",
+  "version-string": "1.5.3",
   "description": "Lazy Followers with SKSE Menu Framework pages instead of the MCM (scripts replaced by this DLL).",
   "dependencies": [
     "nlohmann-json",

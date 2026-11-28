@@ -3,7 +3,7 @@
 An SKSE plugin that replaces [Lazy Followers](https://www.nexusmods.com/skyrimspecialedition/mods/43312) 0.42.3 by [LazyGirl](https://www.nexusmods.com/profile/LazyGirl?gameId=1704): its Papyrus scripts and MCM are now C++ and **SKSE Menu Framework** pages.
 It uses its own modified copy of `LazyFollowers.esp` and the same files and folders as the original mod, so presets, NPC files and the config carry over.
 
-Version 1.5.2. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and three parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, and the inventory lists that show every item.
+Version 1.5.3. Built and tested on Skyrim **AE 1.6.1170**. It uses CommonLibSSE-NG with Address Library, so other SE / AE versions may load it, but they are not tested, and four parts only run on 1.6.1170: the talk-menu part of modded follower voices (greetings / answers in the talk menu), clearing a taken-over NPC's race-change face on Remove, the inventory lists that show every item, and Keep Clothes.
 
 ## Requirements
 
@@ -43,6 +43,7 @@ No longer needed: SkyUI / MCM, JContainers, PapyrusUtil, powerofthree's Papyrus 
 - **Settings**:
   - Nearby Actors with Save Actor Preset: saves any nearby actor's RaceMenu look and face tint, no console needed. The actor selected in the console, or else the actor you look at, is ticked by itself.
   - RaceMenu Mode, behaviour options, Config / NPC data files, logging.
+  - Keep Clothes (on by default): followers keep the clothes you leave them in. The game no longer puts the best clothes they carry back on when they load in, change area or are summoned (also after Storage). Mods that dress followers themselves (outfit managers) are not stopped.
   - Presets: one table of all RaceMenu presets (search, tick any number). Right-click: Hide (its .jslot, .dds and .nif are renamed to .hidden, nothing deleted), Unhide, Delete. Hidden ones are greyed out.
   - Hotkeys (each with Clear and Reset; one key per hotkey): open the pages as tabs in a window of their own; summon the selected follower; summon all followers; save your own look as a preset (asks a name, like `skee preset-save`); open the inventory of the ticked actor (an NPC's as a trade window, your own as normal; the hotkey again closes it); open Nearby Actors in a window of its own; send the follower you look at to Storage.
 

@@ -27,6 +27,8 @@
 #include "Tint.h"
 #include "Voice.h"
 
+#include <shared_mutex>
+
 // CommonLibSSE-NG 3.7 only declares TESPackageEvent (the event behind Papyrus OnPackageStart); layout as
 // in powerof3's CommonLibSSE. We only read the actor and the type.
 namespace RE
@@ -150,6 +152,12 @@ namespace LF
         // NG (user): Settings > Full Inventory Player / NPC - the inventory hooks' every-item lists (read by the hooks)
         std::atomic<bool> g_fullInvPlayer{ true };
         std::atomic<bool> g_fullInvNpc{ true };
+        // NG (150, user: "Storage doesn't keep the current equip state"): Settings > Keep Clothes - the game's outfit update
+        // (OutfitUpdateHook) is skipped for active followers. g_keepRefs = their refs, read by the hook on any thread
+        // (own lock, never held while calling the game; taken after g_lock, never before it).
+        std::atomic<bool>       g_keepClothes{ true };
+        std::shared_mutex       g_keepMutex;
+        std::vector<RE::FormID> g_keepRefs;
         float g_scanRadius = kDefaultScanRadius;   // Nearby Actors scan radius (metres)
         int   g_nearbyRows = kDefaultNearbyRows;   // Nearby Actors table rows before it scrolls
         std::vector<float>         g_nearbyWidths;  // Nearby Actors column widths (empty = default)
@@ -2379,6 +2387,30 @@ namespace LF
             After(2.0f, []() { WwmLoop(); });
         }
 
+        // (150) g_keepRefs = the refs of every active follower (slot and taken-over NPC). Caller holds g_lock.
+        void SetKeepRefsLocked()
+        {
+            std::vector<RE::FormID> refs;
+            for (const auto& s : g_slots) {
+                if (s.ref && s.Active()) {
+                    refs.push_back(s.ref);
+                }
+            }
+            std::unique_lock keep(g_keepMutex);
+            g_keepRefs = std::move(refs);
+        }
+
+        // (150) The list again once a second (slots change in many places; a second late is fine - the outfit update
+        // runs on loads / area changes, and the load fills the list from the co-save first).
+        void KeepLoop()
+        {
+            {
+                std::lock_guard lock(g_lock);
+                SetKeepRefsLocked();
+            }
+            After(1.0f, []() { KeepLoop(); });
+        }
+
         // NG 1.2: a real NPC's own look back (Remove): RaceMenu preset, body morphs and overlays off, its own race,
         // then its 3D rebuilt (Disable / Enable) so its own face shows again. Then (user: "Remove should remove the
         // follower, or move it away, like it already does") it goes back to its own place in the world
@@ -2605,16 +2637,21 @@ namespace LF
                 chain->ThenDo([name = DisplayName(a_actor)]() { Out(std::format("{} - player teammate again (summon)", name)); });
             }
             if (a_actor->IsDisabled()) {
+                chain->ThenDo([a_actor]() { OnMain([a_actor]() { Out(std::format("{} - summon: before its Enable: {}", DisplayName(a_actor), WornLog(a_actor))); }); });  // diagnostics (149)
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Enable", d, false); });
+                chain->ThenDo([a_actor]() { OnMain([a_actor]() { Out(std::format("{} - summon: after its Enable: {}", DisplayName(a_actor), WornLog(a_actor))); }); });
             }
             // NG fix (user picture 2026-11-21: the follower's belly sometimes stuck out after a summon; Disable + Enable
             // fixed it): a MoveTo of an actor whose 3D is loaded drags its body physics (CBPC / SMP bones) along the
             // jump. Such an actor is disabled for the move and enabled at its new place - fresh 3D, fresh physics.
             // Not loaded (e.g. fresh from storage): moved as before.
             const bool blink = !a_actor->IsDisabled() && a_actor->Is3DLoaded();
-            // (142) what it wears now, unless Storage already remembered it (it may be bare by now) - put back on arrival
+            // (142) what it wears now, unless Storage already remembered it (it may be bare by now) - put back on arrival.
+            // NG fix (148b, user: a follower undressed, then summoned, got her old clothes back): a player teammate keeps
+            // its clothes (145), so what it wears now IS right - it replaces the list of the last preset pass (made before
+            // you undressed it). A non-teammate (dismissed by Storage, maybe stripped by the game) keeps the remembered list.
             if (blink) {
-                RememberWorn(slotOf, a_actor, false);
+                RememberWorn(slotOf, a_actor, a_actor->IsPlayerTeammate());
                 chain->Then([a_actor](Papyrus::Done d) { return Papyrus::CallMethod(a_actor, "ObjectReference", "Disable", d, false); });
             }
             chain->Then([a_actor, a_target, dx, dy](Papyrus::Done d) {
@@ -3237,10 +3274,19 @@ namespace LF
                 if (s.home && s.Active() && s.ref && a_intfc->OpenRecord(kRecHome, kVersion)) {
                     WriteForm(a_intfc, s.ref);
                 }
-                if (!s.dress.empty() && s.Active() && s.ref && a_intfc->OpenRecord(kRecDress, kVersion)) {
+                // NG fix (user: a follower saved naked got her clothes put back on after the load): the remembered list
+                // is from the last preset pass, before you undressed her. A follower that is out in the world (not in
+                // storage, not sent home) saves what it wears NOW - the load's re-dress then puts back only that.
+                auto dress = s.dress;
+                if (s.Active() && s.ref && !s.home) {
+                    if (auto a = RE::TESForm::LookupByID<RE::Actor>(s.ref); a && a->Is3DLoaded() && !a->IsDisabled()) {
+                        dress = WornIds(a);
+                    }
+                }
+                if (!dress.empty() && s.Active() && s.ref && a_intfc->OpenRecord(kRecDress, kVersion)) {
                     WriteForm(a_intfc, s.ref);
-                    a_intfc->WriteRecordData(static_cast<std::uint32_t>(s.dress.size()));
-                    for (auto id : s.dress) {
+                    a_intfc->WriteRecordData(static_cast<std::uint32_t>(dress.size()));
+                    for (auto id : dress) {
                         WriteForm(a_intfc, id);
                     }
                 }
@@ -3325,6 +3371,7 @@ namespace LF
                 j["CustomSpells"] = g_spellsEnabled;
                 j["FullInventoryPlayer"] = g_fullInvPlayer.load();
                 j["FullInventoryNPC"] = g_fullInvNpc.load();
+                j["KeepClothes"] = g_keepClothes.load();
                 j["ScanRadius"] = g_scanRadius;
                 j["NearbyRows"] = g_nearbyRows;
                 j["NearbyWidths"] = g_nearbyWidths;
@@ -3414,6 +3461,9 @@ namespace LF
                 flag("FullInventoryNPC", npc);
                 g_fullInvPlayer = player;
                 g_fullInvNpc = npc;
+                bool keep = g_keepClothes.load();
+                flag("KeepClothes", keep);
+                g_keepClothes = keep;
             }
             if (auto v = Files::Find(*j, "ScanRadius"); v && v->is_number()) {
                 g_scanRadius = std::clamp(v->get<float>(), 1.0f, 100.0f);
@@ -3669,6 +3719,7 @@ namespace LF
                 ApplySex(static_cast<int>(i));
                 ApplyRealSkin(static_cast<int>(i));  // NG 1.2: before the 3D is built too
             }
+            SetKeepRefsLocked();  // (150) Keep Clothes knows the followers before their 3D / outfit is set up
         }
 
         // ---- events ----
@@ -3813,6 +3864,87 @@ namespace LF
                     } else {
                         ScheduleUpdate(i, false);
                     }
+                }
+                return RE::BSEventNotifyControl::kContinue;
+            }
+        };
+
+        // Diagnostics (149, user: a follower stored naked comes back dressed from Summon NPC, NFF off - log 01:01:49 ->
+        // 01:01:50 dressed before its 3D loaded): one line per item put on / taken off one of our followers, by anyone
+        // (game, other mods, us), to see at which summon step (teammate on / Enable / MoveTo) the clothes go on.
+        // Diagnostics (149c): the call stack at this point, one entry per frame: "SkyrimSE+RVA" (look up with
+        // Tools\addrlib.py --rva) or "<dll>+offset" for other modules (SKSE plugins). Our own frames are skipped.
+        std::string StackLog()
+        {
+            void*      frames[40]{};
+            const auto n = RtlCaptureStackBackTrace(1, 40, frames, nullptr);
+            const auto gameBase = REL::Module::get().base();
+            HMODULE    self = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&StackLog), &self);
+            std::string out;
+            for (USHORT i = 0; i < n; ++i) {
+                HMODULE mod = nullptr;
+                if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(frames[i]), &mod) || !mod) {
+                    out += std::format(" ?{:X}", reinterpret_cast<std::uintptr_t>(frames[i]));
+                    continue;
+                }
+                if (mod == self) {
+                    continue;
+                }
+                const auto off = reinterpret_cast<std::uintptr_t>(frames[i]) - reinterpret_cast<std::uintptr_t>(mod);
+                if (reinterpret_cast<std::uintptr_t>(mod) == gameBase) {
+                    out += std::format(" SkyrimSE+{:X}", off);
+                } else {
+                    char path[MAX_PATH]{};
+                    GetModuleFileNameA(mod, path, MAX_PATH);
+                    out += std::format(" {}+{:X}", std::filesystem::path(path).filename().string(), off);
+                }
+            }
+            return out;
+        }
+
+        // The base NPC's outfit and its items (diagnostics 149c)
+        std::string OutfitLog(RE::Actor* a_actor)
+        {
+            auto npc = a_actor ? a_actor->GetActorBase() : nullptr;
+            auto o = npc ? npc->defaultOutfit : nullptr;
+            if (!o) {
+                return "outfit none";
+            }
+            std::string out = std::format("outfit {:08X} [", o->GetFormID());
+            for (auto item : o->outfitItems) {
+                if (item) {
+                    out += std::format(" {} {:08X}", item->GetName(), item->GetFormID());
+                }
+            }
+            return out + " ]";
+        }
+
+        class EquipSink : public RE::BSTEventSink<RE::TESEquipEvent>
+        {
+        public:
+            RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, RE::BSTEventSource<RE::TESEquipEvent>*) override
+            {
+                if (!a_event || !a_event->actor || !g_inGame.load()) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                const auto  id = a_event->actor->GetFormID();
+                std::string name;
+                {
+                    std::lock_guard lock(g_lock);
+                    for (const auto& s : g_slots) {
+                        if (s.ref && s.ref == id && s.Active()) {
+                            name = s.name;
+                            break;
+                        }
+                    }
+                }
+                if (!name.empty()) {
+                    auto item = RE::TESForm::LookupByID(a_event->baseObject);
+                    auto a = a_event->actor->As<RE::Actor>();
+                    Out(std::format("{} - equip event: {} {} {:08X} (3D {}, disabled {}, teammate {}, {}) stack:{}", name, a_event->equipped ? "ON " : "OFF",
+                        item ? item->GetName() : "?", a_event->baseObject, a_event->actor->Is3DLoaded(), a_event->actor->IsDisabled(),
+                        a && a->IsPlayerTeammate(), OutfitLog(a), StackLog()));
                 }
                 return RE::BSEventNotifyControl::kContinue;
             }
@@ -4261,6 +4393,8 @@ namespace LF
             holder->AddEventSink<RE::TESObjectLoadedEvent>(&load);
             static PackageSink package;
             holder->AddEventSink<RE::TESPackageEvent>(&package);
+            static EquipSink equip;  // diagnostics (149)
+            holder->AddEventSink<RE::TESEquipEvent>(&equip);
         }
         static CellSink cell;
         if (auto player = RE::PlayerCharacter::GetSingleton()) {
@@ -4363,6 +4497,7 @@ namespace LF
         g_wwmLastState.clear();
         g_pluginFollowerScripts.clear();  // (136) scanned again for this game
         After(3.0f, []() { WwmLoop(); });
+        KeepLoop();  // (150) Keep Clothes follower list, now and once a second
     }
 
     void OnLeaveGame()
@@ -4658,6 +4793,14 @@ namespace LF
         SaveSettings();
     }
 
+    bool KeepClothes() { return g_keepClothes.load(); }
+
+    void SetKeepClothes(bool a_on)
+    {
+        g_keepClothes = a_on;
+        SaveSettings();
+    }
+
     float ScanRadius()
     {
         std::lock_guard lock(g_lock);
@@ -4690,6 +4833,7 @@ namespace LF
             g_includeEquip = true;
             g_fullInvPlayer = true;
             g_fullInvNpc = true;
+            g_keepClothes = true;
             g_scanRadius = kDefaultScanRadius;
             g_nearbyRows = kDefaultNearbyRows;
             g_presetRows = kDefaultNearbyRows;
@@ -5667,6 +5811,49 @@ namespace LF
             std::memcpy(&rel, b + 1, sizeof(rel));
             return a_at + 5 + static_cast<std::intptr_t>(rel) == a_target;
         }
+
+        // NG (150, user: a follower stored naked came back dressed; logs 2026-11-28 01:11-01:52 with equip stacks; RE in
+        // Docs/nff-structure.md): when an NPC's outfit is set up again (3D load, cell attach, MoveTo - id 24725 calls at
+        // +0x156) the game's NPC outfit update (id 418622) puts on the default outfit and then, for every body slot,
+        // the best armor / clothes it carries. Our followers' clothes are yours to choose: with Keep Clothes on, that
+        // call is skipped for an active follower. Args (from the call): TESNPC, the actor, 4 bool flags (2 on the stack).
+        using OutfitUpdateFn = void (*)(void*, RE::TESObjectREFR*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+        OutfitUpdateFn g_outfitUpdate = nullptr;
+
+        void OutfitUpdateHook(void* a_npc, RE::TESObjectREFR* a_ref, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6)
+        {
+            if (g_keepClothes.load() && a_ref && a_ref->GetFormType() == RE::FormType::ActorCharacter) {
+                const auto id = a_ref->GetFormID();
+                bool       keep = false;
+                {
+                    std::shared_lock lock(g_keepMutex);
+                    keep = std::find(g_keepRefs.begin(), g_keepRefs.end(), id) != g_keepRefs.end();
+                }
+                if (keep) {
+                    Out(std::format("{} {:08X} - the game's outfit re-dress skipped (Settings > Keep Clothes)", a_ref->GetName(), id));
+                    return;
+                }
+            }
+            g_outfitUpdate(a_npc, a_ref, a3, a4, a5, a6);
+        }
+    }
+
+    // (150) kDataLoaded: the outfit update call above (1.6.1170 only; a call another mod changed is left alone).
+    void InstallOutfitHook()
+    {
+        const auto runtime = REL::Module::get().version();
+        if (runtime != REL::Version(1, 6, 1170, 0)) {
+            logger::info("Keep Clothes: game {} is not 1.6.1170 - not available", runtime.string("."sv));
+            return;
+        }
+        const auto at = REL::ID(24725).address() + 0x156;
+        if (!IsCallTo(at, REL::ID(418622).address())) {
+            logger::warn("Keep Clothes: the outfit update call at {:X} is not the expected one (another mod?) - not hooked", at - REL::Module::get().base());
+            return;
+        }
+        SKSE::AllocTrampoline(14);
+        g_outfitUpdate = reinterpret_cast<OutfitUpdateFn>(SKSE::GetTrampoline().write_call<5>(at, OutfitUpdateHook));
+        logger::info("Keep Clothes: hooked the NPC outfit update (24725+0x156 -> 418622)");
     }
 
     void InstallInventoryHook()

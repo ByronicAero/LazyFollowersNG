@@ -80,6 +80,7 @@ namespace
                 Voice::Install();  // modded voices: follower lines in that voice
                 LipLog::Install();  // (146b) diagnostics: voice line / lip sync log
                 LF::InstallInventoryHook();  // NG (user): Open Inventory shows every item
+                LF::InstallOutfitHook();     // NG (150, user): Keep Clothes
                 Voice::StartOwnerScan();  // modded follower voices from the plugin files (Override box)
             }
             break;

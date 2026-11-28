@@ -204,6 +204,8 @@ namespace LF
     void SetFullInventoryPlayer(bool a_on);
     bool FullInventoryNPC();     // NG (user): an NPC's side of Open Inventory lists every item (default on)
     void SetFullInventoryNPC(bool a_on);
+    bool KeepClothes();          // NG (150, user): the game's outfit re-dress is skipped for active followers (default on)
+    void SetKeepClothes(bool a_on);
     bool AutoEquip();
     void SetAutoEquip(bool a_on);
     bool IncludeEquipment();   // NG (user): Copy Kit copies the worn armor / weapons too (default on)
@@ -281,6 +283,7 @@ namespace LF
     void OpenInventory(RE::FormID a_ticked, int a_tries = 0);  // NG (user): Open Inventory hotkey - the ticked actor (an open one is closed first)
     RE::FormID InventoryOpenFor();                 // the actor whose inventory Open Inventory has open now (0 = none)
     void InstallInventoryHook();                   // kDataLoaded: Open Inventory shows every item (ContainerMenu filter hook, 1.6.1170)
+    void InstallOutfitHook();                      // kDataLoaded: Keep Clothes (NPC outfit update hook, 1.6.1170)
     void TeleportTo(int a_slot);
     void Dismiss(int a_slot);                      // reset + back to storage
     void CopyKit(int a_slot);                      // player's worn gear -> follower
